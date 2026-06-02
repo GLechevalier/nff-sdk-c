@@ -1,0 +1,39 @@
+menu "nff SDK"
+
+config NFF_HEARTBEAT_INTERVAL_S
+    int "Heartbeat publish interval (seconds)"
+    default 30
+    range 5 300
+    help
+        How often the device publishes a retained heartbeat to
+        nff/devices/{id}/heartbeat. Lower values improve presence
+        detection speed at the cost of slightly more MQTT traffic.
+
+config NFF_LOG_LINES
+    int "RTC pre-crash log buffer size (lines)"
+    default 32
+    range 8 64
+    help
+        Number of log lines kept in RTC memory across software resets.
+        These are included verbatim in crash reports. Each line is
+        NFF_LOG_LINE_LEN (128) bytes.
+
+config NFF_NONCE_RING_SIZE
+    int "Command nonce ring buffer size"
+    default 16
+    range 4 64
+    help
+        Number of command nonces remembered for replay prevention.
+        When the ring is full, the oldest nonce is evicted. Set
+        higher if your device receives many commands per hour.
+
+config NFF_TIMESTAMP_WINDOW_S
+    int "Command timestamp acceptance window (seconds)"
+    default 300
+    range 60 3600
+    help
+        Commands with timestamps older than this many seconds from the
+        device's current time are rejected. Requires SNTP to be
+        synchronised before nff_connect() for meaningful protection.
+
+endmenu

@@ -1,0 +1,48 @@
+cmake_minimum_required(VERSION 3.16)
+project(nff_tests C)
+
+set(CMAKE_C_STANDARD 99)
+
+# Force POSIX port
+add_compile_definitions(NFF_PORT_POSIX=1)
+
+# SDK source files (excluding platform-specific ports)
+set(NFF_SRCS
+    ../src/nff_core.c
+    ../src/nff_mqtt.c
+    ../src/nff_heartbeat.c
+    ../src/nff_cmd.c
+    ../src/nff_ota.c
+    ../src/nff_crash.c
+    ../src/nff_diag.c
+    ../src/nff_security.c
+    ../src/port/nff_port_posix.c
+)
+
+include_directories(../include ../src)
+
+# Try to find OpenSSL for ECDSA verify in POSIX port
+find_package(OpenSSL QUIET)
+if(OpenSSL_FOUND)
+    set(CRYPTO_LIB OpenSSL::SSL OpenSSL::Crypto)
+    add_compile_definitions(HAVE_OPENSSL=1)
+else()
+    set(CRYPTO_LIB "")
+endif()
+
+# Helper: build a test executable
+function(add_nff_test name)
+    add_executable(${name} ${name}.c ${NFF_SRCS})
+    if(WIN32)
+        target_link_libraries(${name} ${CRYPTO_LIB})
+    else()
+        target_link_libraries(${name} ${CRYPTO_LIB} pthread)
+    endif()
+    add_test(NAME ${name} COMMAND ${name})
+endfunction()
+
+enable_testing()
+
+add_nff_test(test_nonce_ring)
+add_nff_test(test_cmd_dispatch)
+add_nff_test(test_ota_rollback)
