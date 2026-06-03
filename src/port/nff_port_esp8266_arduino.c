@@ -90,6 +90,9 @@ nff_mqtt_handle_t *nff_port_mqtt_create(void) {
     struct nff_mqtt_handle *h = new struct nff_mqtt_handle();
     s_mqtt_handle = h;
     h->client.setCallback(pubsub_8266_callback);
+    /* PubSubClient defaults to a 256B buffer, which silently drops larger
+       inbound PUBLISHes (e.g. ~400B+ OTA commands). Enlarge once at create. */
+    h->client.setBufferSize(NFF_MQTT_BUFFER_SIZE);
     return (nff_mqtt_handle_t *)h;
 }
 

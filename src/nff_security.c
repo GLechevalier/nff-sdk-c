@@ -97,7 +97,10 @@ static int build_tbs(const char *payload, size_t plen,
 int nff_security_verify_cmd(const char *payload, size_t plen) {
     char nonce[NFF_NONCE_LEN]       = {0};
     uint32_t timestamp              = 0;
-    char sig_hex[144]               = {0}; /* DER ECDSA-P256 max ~72 bytes → 144 hex + null */
+    char sig_hex[145]               = {0}; /* DER ECDSA-P256 max 72 bytes → 144 hex chars + NUL = 145.
+                                              MUST be 145, not 144: a 72-byte sig (both r,s sign-padded,
+                                              ~26% of signatures) is 144 hex chars and overflowed a 144
+                                              buffer, making nff_json_get_str fail → spurious cmd rejects. */
 
     if (nff_json_get_str(payload, plen, "nonce",     nonce,   sizeof(nonce))   != 0) return NFF_ERR_SECURITY;
     if (nff_json_get_u32(payload, plen, "timestamp", &timestamp)               != 0) return NFF_ERR_SECURITY;

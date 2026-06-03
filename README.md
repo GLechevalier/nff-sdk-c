@@ -52,7 +52,24 @@ The SDK maintains a second MQTT connection to the nff broker running alongside y
 
 ### Arduino Library Manager
 
-Copy this repository into your Arduino `libraries/` folder, or install via the Library Manager once published.
+This repository is the **single source of truth**. The Arduino IDE/CLI, however, needs a
+*flat* library layout (every file under `src/`, and the ESP32 port carrying a `.cpp`
+extension because it is C++). Don't hand-copy — regenerate it:
+
+```bash
+python tools/sync_arduino_lib.py          # writes <sketchbook>/libraries/nff from this repo
+```
+
+This flattens the tree, duplicates `nff.h` to the library root + `src/`, renames the ESP32
+Arduino port `.c` → `.cpp`, and excludes the non-Arduino ports. The transform is idempotent.
+Install the git hooks once so the library re-syncs automatically on every commit/merge:
+
+```bash
+pwsh tools/install-hooks.ps1              # post-commit + post-merge → run the generator
+```
+
+> A plain symlink does **not** work: Arduino would compile all four guarded ports and choke
+> on C++ in a `.c` file. The generated copy is the supported model.
 
 ### ESP-IDF component
 
@@ -202,6 +219,12 @@ Optional tuning via `#define` before including `nff.h` (or via Kconfig on ESP-ID
 | `NFF_LOG_LINES` | `32` | RTC pre-crash log buffer depth |
 | `NFF_NONCE_RING_SIZE` | `16` | Command replay-prevention ring size |
 | `NFF_TIMESTAMP_WINDOW_S` | `300` | Command timestamp acceptance window (±5 min) |
+| `NFF_MQTT_BUFFER_SIZE` | `1024` | MQTT RX/TX buffer. **Must exceed the largest command** — an OTA command is ~421 B and PubSubClient's 256 B default *silently drops* it. Bump to `2048` for very long pre-signed URLs. |
+
+> **Timestamp window & SNTP:** the `NFF_TIMESTAMP_WINDOW_S` check is **skipped** until the
+> device clock is set (the SDK treats `millis()/1000 < 1e9` as "not yet SNTP-synced"). If you
+> enable SNTP, make sure the clock is correct before `nff_connect()` or commands will be
+> rejected once it crosses the window. Replay protection via the nonce ring is always active.
 
 ---
 
@@ -266,7 +289,10 @@ nff-sdk-c/
 │   ├── arduino_basic/     ← minimal Arduino sketch
 │   └── espidf_basic/      ← minimal ESP-IDF app
 ├── tools/
-│   └── gen_credentials.py ← called by `nff provision new-device`
+│   ├── gen_credentials.py ← called by `nff provision new-device`
+│   ├── sync_arduino_lib.py← regenerate the flat Arduino library from this repo
+│   ├── install-hooks.ps1  ← install the auto-sync git hooks
+│   └── hooks/             ← post-commit / post-merge (run the generator)
 ├── tests/
 │   ├── test_nonce_ring.c
 │   ├── test_cmd_dispatch.c
@@ -285,7 +311,18 @@ Commands are authenticated at two independent layers:
 1. **mTLS** — the device presents a per-device client certificate. The nff broker rejects connections without a valid certificate signed by the nff CA. The device pins the CA and rejects any broker not signed by it.
 2. **Command signature** — every command carries an ECDSA-P256 signature over the action, URL, nonce, and timestamp. The device verifies this against the fleet-wide command-verify public key embedded in `credentials.h`. Commands pass or fail independent of the TLS layer.
 
-For OTA, a third layer applies on the device: the bootloader's Secure Boot V2 verifies the firmware binary signature against a key burned into eFuses. A fully compromised nff server cannot push malicious firmware without the HSM-held build key.
+**Verified OTA path (current V1, ESP32 Arduino):** signed `ota` command → HTTPS streaming
+download → SHA-256 verification of the downloaded image against the hash carried in the
+*signed* command → `Update.end()` boot-partition switch → reboot → `ota_result`. The image's
+integrity is therefore bound to the command signature (a forged hash needs the command-signing
+key). Note the Arduino port currently downloads with `WiFiClientSecure::setInsecure()` — the
+firmware **server's** TLS cert is not pinned, so transport authenticity for the download relies
+on the SHA-256 + command signature, not on the HTTPS cert.
+
+**Production hardening (V2):** the bootloader's Secure Boot V2 verifies the firmware binary
+signature against a key burned into eFuses, so a fully compromised nff server still cannot run
+malicious firmware without the HSM-held build key. This hardware layer is independent of the
+software OTA path above.
 
 See [IOT_BRIDGE.md](../IOT_BRIDGE.md) for the full threat model and defence-in-depth chain.
 
@@ -294,4 +331,3 @@ See [IOT_BRIDGE.md](../IOT_BRIDGE.md) for the full threat model and defence-in-d
 ## License
 
 MIT
-# nff-sdk-c

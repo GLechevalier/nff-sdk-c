@@ -31,6 +31,7 @@
 
 #if defined(ESP_PLATFORM)
 #  include "esp_attr.h"
+#  include "esp_system.h"
 #  define NFF_RTC_ATTR RTC_NOINIT_ATTR
 #else
 #  define NFF_RTC_ATTR
@@ -60,7 +61,7 @@ void nff_crash_log(const char *line) {
 
     /* Also output to UART via platform log */
 #if defined(ESP_PLATFORM)
-    esp_rom_printf("[nff] %s\n", line);
+    printf("[nff] %s\n", line);
 #elif defined(ARDUINO)
     Serial.println(line);
 #else

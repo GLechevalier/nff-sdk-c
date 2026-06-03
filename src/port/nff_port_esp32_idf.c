@@ -192,6 +192,11 @@ int nff_port_mqtt_connect(nff_mqtt_handle_t *h,
                 .retain  = 1,
             },
         },
+        /* Match the Arduino ports: ensure the RX/TX buffer fits OTA-sized
+           commands. esp-mqtt defaults to 1024, but set it explicitly. */
+        .buffer = {
+            .size = NFF_MQTT_BUFFER_SIZE,
+        },
     };
 
     mh->client = esp_mqtt_client_init(&cfg);

@@ -9,9 +9,12 @@
 
 #if defined(ARDUINO) && defined(ESP32)
 
+#include "nff.h"
 #include "nff_port.h"
 #include <Arduino.h>
+#include <WiFiClient.h>
 #include <WiFiClientSecure.h>
+#include <mbedtls/base64.h>
 #include <PubSubClient.h>
 #include <Preferences.h>
 #include <Update.h>
@@ -62,6 +65,33 @@ void nff_port_task_create(void (*fn)(void *), const char *name,
 /* MQTT (PubSubClient + WiFiClientSecure)                              */
 /* ------------------------------------------------------------------ */
 
+/* Convert DER bytes to a null-terminated PEM string (heap-allocated). */
+static char *der_to_pem(const char *header, const char *footer,
+                         const uint8_t *der, size_t der_len) {
+    size_t b64_len = 0;
+    mbedtls_base64_encode(nullptr, 0, &b64_len, der, der_len);
+
+    uint8_t *b64 = (uint8_t *)malloc(b64_len + 1);
+    if (!b64) return nullptr;
+    size_t actual = 0;
+    mbedtls_base64_encode(b64, b64_len + 1, &actual, der, der_len);
+
+    size_t hdr = strlen(header), ftr = strlen(footer);
+    size_t lines = (actual + 63) / 64;
+    char *pem = (char *)malloc(hdr + 1 + actual + lines + ftr + 2);
+    if (!pem) { free(b64); return nullptr; }
+
+    char *p = pem;
+    memcpy(p, header, hdr); p += hdr; *p++ = '\n';
+    for (size_t pos = 0; pos < actual; ) {
+        size_t n = (actual - pos > 64) ? 64 : (actual - pos);
+        memcpy(p, b64 + pos, n); p += n; *p++ = '\n'; pos += n;
+    }
+    memcpy(p, footer, ftr); p += ftr; *p++ = '\n'; *p = '\0';
+    free(b64);
+    return pem;
+}
+
 struct nff_mqtt_handle {
     WiFiClientSecure  tls;
     PubSubClient      client;
@@ -71,10 +101,16 @@ struct nff_mqtt_handle {
     char              lwt_topic[NFF_TOPIC_MAXLEN];
     char              lwt_payload[256];
     bool              tls_configured;
+    char             *ca_pem;
+    char             *cert_pem;
+    char             *key_pem;
     void (*rx_cb)(const char *, const uint8_t *, size_t, void *);
     void *rx_user;
 
-    nff_mqtt_handle() : client(tls), tls_configured(false), rx_cb(nullptr), rx_user(nullptr) {}
+    nff_mqtt_handle() : client(tls), tls_configured(false),
+                        ca_pem(nullptr), cert_pem(nullptr), key_pem(nullptr),
+                        rx_cb(nullptr), rx_user(nullptr) {}
+    ~nff_mqtt_handle() { free(ca_pem); free(cert_pem); free(key_pem); }
 };
 
 static void pubsub_callback(char *topic, byte *payload, unsigned int length) {
@@ -93,6 +129,9 @@ nff_mqtt_handle_t *nff_port_mqtt_create(void) {
     struct nff_mqtt_handle *h = new struct nff_mqtt_handle();
     g_nff_mqtt_handle = h;
     h->client.setCallback(pubsub_callback);
+    /* PubSubClient defaults to a 256B buffer, which silently drops larger
+       inbound PUBLISHes (e.g. ~400B+ OTA commands). Enlarge once at create. */
+    h->client.setBufferSize(NFF_MQTT_BUFFER_SIZE);
     return (nff_mqtt_handle_t *)h;
 }
 
@@ -109,9 +148,15 @@ void nff_port_mqtt_set_tls(nff_mqtt_handle_t *hh,
                             const uint8_t *cert, size_t cert_len,
                             const uint8_t *key, size_t key_len) {
     struct nff_mqtt_handle *h = (struct nff_mqtt_handle *)hh;
-    h->tls.setCACert((const char *)ca);         (void)ca_len;
-    h->tls.setCertificate((const char *)cert);  (void)cert_len;
-    h->tls.setPrivateKey((const char *)key);    (void)key_len;
+    free(h->ca_pem);
+    free(h->cert_pem);
+    free(h->key_pem);
+    h->ca_pem   = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", ca,   ca_len);
+    h->cert_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", cert, cert_len);
+    h->key_pem  = der_to_pem("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----",  key,  key_len);
+    if (h->ca_pem)   h->tls.setCACert(h->ca_pem);
+    if (h->cert_pem) h->tls.setCertificate(h->cert_pem);
+    if (h->key_pem)  h->tls.setPrivateKey(h->key_pem);
     h->tls_configured = true;
 }
 
@@ -262,18 +307,42 @@ int nff_port_https_get_stream(const char *url,
     int http_code = http.GET();
     if (http_code != 200) { http.end(); return -1; }
 
+    int        total  = http.getSize();        /* Content-Length, or -1 if unknown */
     WiFiClient *stream = http.getStreamPtr();
-    uint8_t   buf[512];
-    int       rc = 0;
-    int       available;
+    uint8_t    buf[1024];
+    int        rc = 0;
+    size_t     received = 0;
+    uint32_t   last_data = millis();
 
-    while (http.connected() && (available = stream->available()) >= 0) {
-        int n = stream->readBytes(buf, sizeof(buf));
-        if (n <= 0) break;
-        rc = chunk_cb(buf, (size_t)n, user_ctx);
-        if (rc < 0) break;
+    /* Read until we have the full Content-Length (or, if unknown, until the
+       peer disconnects). Do NOT break on a transient empty read — a multi-
+       hundred-KB TLS transfer routinely stalls >1s between records, and the
+       old `readBytes()<=0 -> break` truncated the image and still returned
+       success, causing a SHA-256 mismatch on a partial download. */
+    while (true) {
+        if (total >= 0 && received >= (size_t)total) break;   /* got it all */
+
+        size_t avail = stream->available();
+        if (avail > 0) {
+            size_t want = avail > sizeof(buf) ? sizeof(buf) : avail;
+            int n = stream->readBytes(buf, want);
+            if (n > 0) {
+                rc = chunk_cb(buf, (size_t)n, user_ctx);
+                if (rc < 0) break;
+                received += (size_t)n;
+                last_data = millis();
+            }
+        } else {
+            if (!http.connected() && stream->available() == 0) break;  /* EOF */
+            if (millis() - last_data > timeout_ms) { rc = -1; break; }  /* real stall */
+            delay(1);
+        }
     }
     http.end();
+
+    /* A short read with no explicit error is still a failure — never let a
+       truncated image reach the SHA-256 check as if it succeeded. */
+    if (rc == 0 && total >= 0 && received != (size_t)total) rc = -1;
     return rc;
 }
 
@@ -345,20 +414,10 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
 
 static void (*s_panic_hook)(const char *) = nullptr;
 
-static void IRAM_ATTR nff_arduino_panic(const esp_panic_info_t *info) {
-    if (s_panic_hook) {
-        char r[64];
-        snprintf(r, sizeof(r), "cause=%d pc=0x%08x",
-                 (int)info->exception_cause,
-                 (unsigned)(uintptr_t)info->exception_addr);
-        s_panic_hook(r);
-    }
-    esp_default_panic_handler(info);
-}
-
 void nff_port_install_panic_hook(void (*fn)(const char *)) {
+    /* esp_set_panic_handler is not exposed in arduino-esp32 3.x;
+     * crash detection still works via esp_reset_reason() on next boot. */
     s_panic_hook = fn;
-    esp_set_panic_handler(nff_arduino_panic);
 }
 
 /* ------------------------------------------------------------------ */
