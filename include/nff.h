@@ -232,6 +232,9 @@ nff_state_t nff_get_state(void);
 #ifndef NFF_MQTT_BUFFER_SIZE
 #  define NFF_MQTT_BUFFER_SIZE      1024  /* MQTT RX/TX buffer. OTA cmds are ~400B+ (PubSubClient's 256 default silently drops them). Bump to 2048 for very long pre-signed URLs. */
 #endif
+#ifndef NFF_CMD_MAXLEN
+#  define NFF_CMD_MAXLEN            NFF_MQTT_BUFFER_SIZE  /* inbound command parse buffer (nff_cmd_dispatch). Must hold the largest signed command (e.g. an OTA cmd carrying a pre-signed URL); keep >= NFF_MQTT_BUFFER_SIZE so the MQTT layer never delivers more than the parser can hold. */
+#endif
 #ifndef NFF_HEARTBEAT_INTERVAL_S
 #  define NFF_HEARTBEAT_INTERVAL_S  30
 #endif

@@ -48,9 +48,16 @@ void nff_cmd_dispatch(const char *topic, const uint8_t *payload, size_t len) {
 
     if (!payload || len == 0) return;
 
-    /* Work on a null-terminated copy (payload may not be null-terminated) */
-    static char buf[512];
-    if (len >= sizeof(buf)) len = sizeof(buf) - 1;
+    /* Work on a null-terminated copy (payload may not be null-terminated).
+       Buffer must hold the largest signed command (OTA cmds carry a pre-signed
+       URL and run ~600B+). Reject — rather than silently truncate — anything
+       too large, since a truncated copy would always fail signature verify and
+       surface as a misleading "security" rejection. */
+    static char buf[NFF_CMD_MAXLEN];
+    if (len >= sizeof(buf)) {
+        nff_log("nff: cmd too large (%u >= %u), dropped", (unsigned)len, (unsigned)sizeof(buf));
+        return;
+    }
     memcpy(buf, payload, len);
     buf[len] = '\0';
 
