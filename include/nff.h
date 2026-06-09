@@ -124,6 +124,20 @@ typedef struct {
 #  define NFF_BUILD_ID NFF_BUILD_ID_STRINGIFY(NFF_BUILD_ID_TOKEN)
 #endif
 
+/* NFF_FW_VERSION is injected the same bare-token way (-DNFF_FW_VERSION_TOKEN=3.0.13):
+ * a semver like 3.0.13 is a single valid preprocessing token, but passing it quoted
+ * through arduino-cli's build-property tokenizer strips the quotes, so the build server
+ * passes it bare and we stringify it here. A token WINS over any earlier NFF_FW_VERSION
+ * (e.g. a credentials.h default) so the device reports the release version it was built
+ * for and the anti-downgrade gate compares against it. With no token, NFF_FW_VERSION
+ * keeps coming from credentials.h / a direct -DNFF_FW_VERSION. */
+#ifdef NFF_FW_VERSION_TOKEN
+#  undef NFF_FW_VERSION
+#  define NFF_FW_VERSION_STRINGIFY2(x) #x
+#  define NFF_FW_VERSION_STRINGIFY(x)  NFF_FW_VERSION_STRINGIFY2(x)
+#  define NFF_FW_VERSION NFF_FW_VERSION_STRINGIFY(NFF_FW_VERSION_TOKEN)
+#endif
+
 /* Arduino / C++ global initializer — positional, C++ compatible */
 #define NFF_CONFIG(var, id, host)                               \
     nff_config_t var = {                                        \
