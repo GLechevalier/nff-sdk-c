@@ -408,6 +408,25 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
     out->cpu_count     = 2;
 }
 
+void nff_port_get_hw_info(nff_hw_info_t *out) {
+    const char *model = ESP.getChipModel();   /* e.g. "ESP32-D0WD-V3", "ESP32-S3" */
+    snprintf(out->chip_model, sizeof(out->chip_model), "%s", model ? model : "");
+    out->revision   = (uint8_t)ESP.getChipRevision();
+    out->flash_size = (uint32_t)ESP.getFlashChipSize();
+    out->cores      = (uint8_t)ESP.getChipCores();
+
+    /* Derive the canonical device_type family from the model string. The variant
+     * letters (S3/S2/C3/C6/H2) disambiguate; a plain ESP32 has none. */
+    const char *t = "";
+    if      (strstr(model ? model : "", "S3")) t = "esp32s3";
+    else if (strstr(model ? model : "", "S2")) t = "esp32s2";
+    else if (strstr(model ? model : "", "C3")) t = "esp32c3";
+    else if (strstr(model ? model : "", "C6")) t = "esp32c6";
+    else if (strstr(model ? model : "", "H2")) t = "esp32h2";
+    else if (strstr(model ? model : "", "ESP32")) t = "esp32";
+    snprintf(out->device_type, sizeof(out->device_type), "%s", t);
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook                                                           */
 /* ------------------------------------------------------------------ */

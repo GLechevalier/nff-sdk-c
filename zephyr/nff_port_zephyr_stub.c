@@ -60,6 +60,10 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
     if (out) memset(out, 0, sizeof(*out));
 }
 
+void nff_port_get_hw_info(nff_hw_info_t *out) {
+    if (out) memset(out, 0, sizeof(*out));  /* stub: device_type empty = unknown */
+}
+
 void nff_port_install_panic_hook(void (*fn)(const char *)) { (void)fn; }
 
 int nff_port_stall_core(int id)   { (void)id; return NFF_ERR_NOT_SUPPORTED; }

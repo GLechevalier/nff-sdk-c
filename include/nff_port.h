@@ -248,6 +248,29 @@ typedef struct {
 void nff_port_get_diag_info(nff_diag_info_t *out);
 
 /* ------------------------------------------------------------------ */
+/* Hardware identity                                                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Static hardware identity, detected at runtime. Reported in the heartbeat so
+ * the server can gate OTA deployments by device_type (a device can't lie about
+ * its own silicon). Fields a platform can't determine are left empty/zero.
+ *
+ * device_type is the canonical nff family string — lowercase, no separators:
+ * "esp32", "esp32s2", "esp32s3", "esp32c3", "esp32c6", "esp32h2", "esp8266"
+ * ("" if unknown). It MUST match the strings used in an artifact's device_types.
+ */
+typedef struct {
+    char     device_type[16]; /* canonical family, e.g. "esp32s3" ("" if unknown) */
+    char     chip_model[24];  /* raw model string, e.g. "ESP32-D0WD-V3" */
+    uint8_t  revision;        /* silicon revision */
+    uint32_t flash_size;      /* bytes */
+    uint8_t  cores;           /* CPU core count */
+} nff_hw_info_t;
+
+void nff_port_get_hw_info(nff_hw_info_t *out);
+
+/* ------------------------------------------------------------------ */
 /* Panic hook                                                           */
 /* ------------------------------------------------------------------ */
 

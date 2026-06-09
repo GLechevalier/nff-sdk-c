@@ -405,6 +405,14 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
     out->cpu_count     = 1;
 }
 
+void nff_port_get_hw_info(nff_hw_info_t *out) {
+    /* Host build: no real silicon. Leave device_type empty (treated as "unknown"
+     * by the OTA gate) and report a recognizable model for diagnostics. */
+    memset(out, 0, sizeof(*out));
+    snprintf(out->chip_model, sizeof(out->chip_model), "posix");
+    out->cores = 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook                                                           */
 /* ------------------------------------------------------------------ */

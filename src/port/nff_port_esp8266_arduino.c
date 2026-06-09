@@ -377,6 +377,17 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
     out->cpu_count     = 1;
 }
 
+void nff_port_get_hw_info(nff_hw_info_t *out) {
+    /* The ESP8266 is a single fixed part — no chip-info API, so report constants. */
+    strncpy(out->device_type, "esp8266", sizeof(out->device_type) - 1);
+    out->device_type[sizeof(out->device_type) - 1] = '\0';
+    strncpy(out->chip_model, "ESP8266", sizeof(out->chip_model) - 1);
+    out->chip_model[sizeof(out->chip_model) - 1] = '\0';
+    out->revision   = 0;
+    out->flash_size = (uint32_t)ESP.getFlashChipSize();
+    out->cores      = 1;
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook (not available on 8266 — UART output only)               */
 /* ------------------------------------------------------------------ */

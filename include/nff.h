@@ -85,6 +85,7 @@ typedef struct {
     /* Firmware identity — injected by build system via -DNFF_FW_VERSION=... */
     const char    *fw_version;
     const char    *build_id;           /* 16-char hex prefix of ELF SHA-256 */
+    const char    *fqbn;               /* build target, injected via -DNFF_FQBN=... ("" if unset) */
 
     /* Tuning */
     uint32_t       heartbeat_interval_s;  /* 0 = use default (30) */
@@ -93,6 +94,35 @@ typedef struct {
 /* ------------------------------------------------------------------ */
 /* Config convenience macros (require credentials.h in scope)          */
 /* ------------------------------------------------------------------ */
+
+/* The build target (fqbn) is injected on the compile command line as a BARE
+ * token via -DNFF_FQBN_TOKEN=esp32:esp32:esp32 (see nff flash / the build
+ * server). Passing it unquoted avoids cross-shell quoting headaches with the
+ * colons; we stringify it here. A direct -DNFF_FQBN="..." still wins, and a
+ * bare build with neither flag falls back to "" so the symbol always resolves. */
+#ifndef NFF_FQBN
+#  ifdef NFF_FQBN_TOKEN
+#    define NFF_FQBN_STRINGIFY2(x) #x
+#    define NFF_FQBN_STRINGIFY(x)  NFF_FQBN_STRINGIFY2(x)
+#    define NFF_FQBN NFF_FQBN_STRINGIFY(NFF_FQBN_TOKEN)
+#  else
+#    define NFF_FQBN ""
+#  endif
+#endif
+
+/* NFF_BUILD_ID is injected the same bare-token way (-DNFF_BUILD_ID_TOKEN=abc123): a
+ * string passed WITH quotes through arduino-cli's build-property tokenizer loses them
+ * (gcc then reports "stray '\'" / "missing terminating \" character"), so the build
+ * server passes a bare hex token and we stringify it here. When a token is present it
+ * WINS over any earlier NFF_BUILD_ID (e.g. a credentials.h default) so the value baked
+ * into the firmware matches what the build server records on the firmware_versions row.
+ * With no token, NFF_BUILD_ID keeps coming from credentials.h / a direct -DNFF_BUILD_ID. */
+#ifdef NFF_BUILD_ID_TOKEN
+#  undef NFF_BUILD_ID
+#  define NFF_BUILD_ID_STRINGIFY2(x) #x
+#  define NFF_BUILD_ID_STRINGIFY(x)  NFF_BUILD_ID_STRINGIFY2(x)
+#  define NFF_BUILD_ID NFF_BUILD_ID_STRINGIFY(NFF_BUILD_ID_TOKEN)
+#endif
 
 /* Arduino / C++ global initializer — positional, C++ compatible */
 #define NFF_CONFIG(var, id, host)                               \
@@ -106,6 +136,7 @@ typedef struct {
         NFF_CMD_VERIFY_KEY_DER, NFF_CMD_VERIFY_KEY_LEN,        \
         NFF_FW_VERSION,                                         \
         NFF_BUILD_ID,                                           \
+        NFF_FQBN,                                               \
         30                                                      \
     }
 
@@ -124,6 +155,7 @@ typedef struct {
     .cmd_verify_key_len   = NFF_CMD_VERIFY_KEY_LEN,             \
     .fw_version           = NFF_FW_VERSION,                     \
     .build_id             = NFF_BUILD_ID,                       \
+    .fqbn                 = NFF_FQBN,                           \
     .heartbeat_interval_s = 30,                                 \
 }
 

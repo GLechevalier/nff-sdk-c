@@ -19,17 +19,33 @@ static void publish_heartbeat(void) {
     nff_diag_info_t di;
     nff_port_get_diag_info(&di);
 
-    char payload[256];
+    nff_hw_info_t hw;
+    nff_port_get_hw_info(&hw);
+
+    /* device_type/fqbn/chip let the server gate OTA on real hardware identity
+     * (see nff-ota deployment compatibility check). They rarely change, but the
+     * heartbeat is retained so the latest values are always available. */
+    char payload[384];
     snprintf(payload, sizeof(payload),
              "{\"status\":\"online\","
              "\"id\":\"%s\","
              "\"fw\":\"%s\","
              "\"build\":\"%s\","
+             "\"device_type\":\"%s\","
+             "\"fqbn\":\"%s\","
+             "\"chip\":\"%s\","
+             "\"rev\":%u,"
+             "\"flash\":%lu,"
              "\"heap\":%lu,"
              "\"uptime\":%lu}",
              g_nff.cfg->device_id,
              g_nff.cfg->fw_version  ? g_nff.cfg->fw_version  : "",
              g_nff.cfg->build_id    ? g_nff.cfg->build_id    : "",
+             hw.device_type,
+             g_nff.cfg->fqbn        ? g_nff.cfg->fqbn        : "",
+             hw.chip_model,
+             (unsigned)hw.revision,
+             (unsigned long)hw.flash_size,
              (unsigned long)di.free_heap,
              (unsigned long)di.uptime_ms);
 

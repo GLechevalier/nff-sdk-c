@@ -414,6 +414,36 @@ void nff_port_get_diag_info(nff_diag_info_t *out) {
                      ? (int32_t)ap.rssi : 0;
 }
 
+#include "esp_chip_info.h"
+#include "esp_flash.h"
+
+void nff_port_get_hw_info(nff_hw_info_t *out) {
+    esp_chip_info_t info;
+    esp_chip_info(&info);
+
+    /* CONFIG_IDF_TARGET is already the canonical family ("esp32","esp32s3",...),
+     * which is exactly the device_type vocabulary the OTA gate matches on. */
+    snprintf(out->device_type, sizeof(out->device_type), "%s", CONFIG_IDF_TARGET);
+
+    const char *model;
+    switch (info.model) {
+        case CHIP_ESP32:   model = "ESP32";    break;
+        case CHIP_ESP32S2: model = "ESP32-S2"; break;
+        case CHIP_ESP32S3: model = "ESP32-S3"; break;
+        case CHIP_ESP32C3: model = "ESP32-C3"; break;
+        case CHIP_ESP32C6: model = "ESP32-C6"; break;
+        case CHIP_ESP32H2: model = "ESP32-H2"; break;
+        default:           model = "ESP32";    break;
+    }
+    snprintf(out->chip_model, sizeof(out->chip_model), "%s", model);
+    out->revision = (uint8_t)info.revision;
+    out->cores    = (uint8_t)info.cores;
+
+    uint32_t flash = 0;
+    if (esp_flash_get_size(NULL, &flash) != ESP_OK) flash = 0;
+    out->flash_size = flash;
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook                                                           */
 /* ------------------------------------------------------------------ */
