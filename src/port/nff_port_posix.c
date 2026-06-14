@@ -173,9 +173,11 @@ void nff_port_mqtt_set_server(nff_mqtt_handle_t *h,
 void nff_port_mqtt_set_tls(nff_mqtt_handle_t *h,
                             const uint8_t *ca, size_t ca_len,
                             const uint8_t *cert, size_t cert_len,
-                            const uint8_t *key, size_t key_len) {
+                            const uint8_t *key, size_t key_len,
+                            const uint8_t *inter, size_t inter_len) {
     (void)h; (void)ca; (void)ca_len;
     (void)cert; (void)cert_len; (void)key; (void)key_len;
+    (void)inter; (void)inter_len;
     /* No actual TLS on POSIX mock */
 }
 
