@@ -1,5 +1,145 @@
 # What changed
 
+## Status — batch-claim enrollment verified end-to-end on real hardware (2026-06-14)
+
+The §8 device-initiated batch-claim flow (DEVICE_OWNERSHIP_DESIGN.md) now works end-to-end on a
+real ESP32: **announce → auto-accept → rollover → unique per-device cert persisted to NVS → reboot
+into CLAIMED mode → operational MQTT + steady 30 s heartbeat → device online in the dashboard.**
+
+Getting there surfaced **six bugs across the SDK and the fleet broker, plus one tooling trap** —
+each masking the next. They are listed newest-investigation-first below. Cross-repo fixes in
+**nff-fleet** are marked as such.
+
+Layered summary:
+
+0. **Tooling trap — stale Arduino library.** `nff flash` builds a *synced copy* of this SDK, and
+   the sync is **manual + git-commit-keyed**, so **uncommitted** SDK edits never reached the board.
+   A TLS "hang" we chased for a long time was simply the device running last-synced code; a re-sync
+   fixed it. (The sync tooling already existed — see the 2026-06-04 section — but nothing runs it
+   automatically before a flash, and the `.nff_sync_meta` commit marker never changes for uncommitted
+   working-tree edits, so it always looks fresh.)
+1. **Claimed-mode connect had an empty MQTT client_id** → broker rejected the session.
+2. **`nff_connect` double-connected** → broker tore down the just-subscribed session each boot.
+3. **The device parsed every received topic as a command** → flooded by foreign messages.
+4. **(nff-fleet) amqtt 0.11.3 replays *all* retained messages to every client on connect, with no
+   ACL** → the device was flooded with the whole fleet's retained heartbeats/announces, which is both
+   the flood above *and* a §7 tenant-isolation leak.
+5. **(nff-fleet) `audit_log` insert violated `NOT NULL project_id`** on every command.
+6. **POSIX-port build break** (pre-existing) — host unit tests didn't compile.
+
+### Bug 1 — claimed-mode session connected with an empty MQTT client_id
+
+**Problem:** After a device claimed and rebooted into CLAIMED mode, it presented the correct
+operational certificate (`CN = <hwid>`) but an **empty MQTT client_id**, so PubSubClient sent an
+auto-generated `amqtt/<random>` id. The §3 identity ACL requires `client_id == cert CN`, so the
+broker denied the session (`auth deny: client_id=amqtt/… does not match cert CN=…`) and the device
+could never operate. Root cause: `nff_store_load` does `*out = *base`, inheriting the bootstrap
+config's empty `device_id`, and then loads project/certs/keys but **never sets `device_id`** — only
+the bootstrap path filled it (from the hardware id).
+
+**Change:**
+
+| File | Change |
+|---|---|
+| `src/nff_core.c` | In `nff_init`, derive `device_id` from the hardware id in **both** modes — restore it on the loaded config in the CLAIMED path (`device_id == hwid == operational-cert CN`; NVS stores the creds but not the id) |
+
+**Verification:** broker now shows `Session(clientId=<hwid>, connected)` with no auth-deny;
+heartbeats land and `devices.last_seen` updates.
+
+### Bug 2 — `nff_connect` double-connected, churning the session every boot
+
+**Problem:** In CLAIMED mode the device connected, sent one heartbeat, then went silent until a
+~120 s backoff reconnect — flapping, so the reaper kept marking it offline. `nff_connect` called
+`nff_mqtt_init()` (which already opens the MQTT session *and subscribes* to the cmd topic) and then
+called `nff_port_mqtt_connect()` **again**. The duplicate CONNECT from the same client_id makes the
+broker tear down the just-subscribed session and open a fresh, unsubscribed one — visible as a
+double `mqtt connected` on every boot.
+
+**Change:**
+
+| File | Change |
+|---|---|
+| `src/nff_core.c` | Removed the redundant second `nff_port_mqtt_connect()` in `nff_connect`; rely on `nff_mqtt_init`'s connect + subscribe, then just check the result and send the on-connect heartbeat |
+
+**Verification:** serial now shows a **single** `mqtt connected` and heartbeats at exactly the
+configured 30 s interval (uptime 6 s / 36 s / 66 s …); server-side `last_seen` advances every ~30 s
+with the board untouched.
+
+### Bug 3 — every received message was parsed as a command
+
+**Problem:** `nff_cmd_dispatch` ignored the message `topic` (`(void)topic`) and ran signature
+verification on **anything** delivered to the client. Combined with Bug 4 (broker over-delivery),
+the device received other devices' heartbeats, its own retained heartbeat, and bootstrap announces,
+ran a full ECDSA verify on each (tens of ms), failed them all as `cmd rejected (security)`, and the
+flood starved the MQTT keepalive.
+
+**Change:**
+
+| File | Change |
+|---|---|
+| `src/nff_cmd.c` | Drop any message whose topic isn't the device's own cmd topic (`nff_topic_cmd` / `nff_topic_bootstrap_cmd`) **before** any crypto — defense in depth even after the broker is fixed |
+
+**Verification:** the `cmd rejected (security)` flood stops; `test_cmd_dispatch` injects on the
+device's own cmd topic so the filter is transparent to it.
+
+### Bug 4 — (nff-fleet) amqtt replays all retained messages to every client, bypassing the ACL
+
+**Problem:** the root cause of the flood and a tenant-isolation leak. On **every** client connect,
+amqtt 0.11.3 (`broker.py` `_handle_client_session`) iterates the **global** subscription table and,
+via `_publish_retained_messages_for_subscription`, publishes every matching retained message to the
+connecting client **with no ACL check and no check that the client subscribed to that filter**. The
+internal router subscribes to `nff/+/devices/#` + `nff/_bootstrap/#`, so any connecting device was
+handed the whole fleet's retained heartbeats and announces — flooding it offline **and** letting it
+see other devices'/tenants' retained state (violates DEVICE_OWNERSHIP_DESIGN.md §7; the §7 RECEIVE
+ACL the `acl.py` docstring assumed does not exist in 0.11.3).
+
+**Change (nff-fleet):**
+
+| File | Change |
+|---|---|
+| `nff_fleet/broker/broker.py` | New `NffBroker(Broker)` overriding `_publish_retained_messages_for_subscription` to deliver only retained topics the target session is authorised to receive; used in place of `Broker`. Couples to amqtt 0.11.3 internals by necessity — revisit on upgrade |
+| `nff_fleet/broker/acl.py` | Extracted the scoping logic into `topic_allowed(session, topic)`, shared by the ACL plugin and the broker override |
+
+**Verification:** a freshly-connecting device no longer receives any cross-namespace retained
+message; the device stays online; `nff-fleet` unit tests 50/50 pass.
+
+### Bug 5 — (nff-fleet) `audit_log` insert violated NOT NULL `project_id`
+
+**Problem:** every signed command logged `db task error: null value in column "project_id" of
+relation "audit_log" violates not-null constraint`. `send_command` had the `project_id` (it signs
+with the project key) but never passed it down the audit chain.
+
+**Change (nff-fleet):**
+
+| File | Change |
+|---|---|
+| `nff_fleet/commands.py`, `nff_fleet/audit.py`, `nff_fleet/db.py` | Thread `project_id` through `send_command` → `audit.log_command` → `db.append_audit` and include it in the `audit_log` insert (and the jsonl mirror) |
+
+**Verification:** command audit rows insert cleanly; `nff-fleet` tests pass.
+
+### Bug 6 — POSIX port didn't compile (pre-existing; blocked host tests)
+
+**Problem:** `nff_port_mqtt_set_tls` gained the project-intermediate params (`inter`, `inter_len`)
+in `nff_port.h` and the ESP32 port for the Phase-3 cert chain, but the POSIX mock was never updated
+— `conflicting types for 'nff_port_mqtt_set_tls'`, so the entire host unit-test build was broken
+before this session.
+
+**Change:**
+
+| File | Change |
+|---|---|
+| `src/port/nff_port_posix.c` | Add the `inter`/`inter_len` params (ignored — no real TLS on POSIX) to match the header |
+
+**Verification:** host tests build again; `test_nonce_ring`, `test_ota_rollback`,
+`test_claim_rollover` pass (`test_cmd_dispatch` is blocked from launching by local AV, not a code
+failure — it builds and uses a matching cmd topic).
+
+### Also — diagnosability improvements kept from the investigation
+
+| File | Change |
+|---|---|
+| `src/port/nff_port_esp32_arduino.c` | Log the cause of a failed MQTT connect (`state` + WiFi status + TLS error) instead of a silent reconnect loop; `setHandshakeTimeout(15)` so a TLS connect returns in ~15 s instead of hanging ~120 s; add `#include <WiFi.h>` for the status read |
+
 ## Status — OTA verified working end-to-end (2026-06-04)
 
 A full over-the-air update now succeeds on real hardware: `test-device-01` was updated
