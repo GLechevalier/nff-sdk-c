@@ -13,6 +13,11 @@
 #include <stdio.h>
 #include <stdarg.h>
 
+#if NFF_BOOTSTRAP_ENABLED
+#include "nff_store.h"
+#include "nff_port.h"
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Global context                                                       */
 /* ------------------------------------------------------------------ */
@@ -60,6 +65,35 @@ int nff_init(const nff_config_t *cfg) {
 
     reset_backoff();
 
+#if NFF_BOOTSTRAP_ENABLED
+    /* Claim enrollment (DEVICE_OWNERSHIP_DESIGN.md §8): NVS-first. If a per-device operational cert
+     * was rolled over earlier it lives in NVS and wins; otherwise fall back to the shared firmware-
+     * baked batch credential and run in BOOTSTRAP mode (device_id = runtime hardware id, since the
+     * image is identical across the batch). */
+    static nff_config_t s_loaded;
+    static nff_config_t s_active;
+    static char s_hwid[24];
+    /* device_id == hwid == operational-cert CN in BOTH modes: the hwid the device announced is what
+     * the fleet assigned as device_id and baked into the rolled-over cert's CN. NVS stores the creds
+     * but not the id, so derive it from the hardware id either way — otherwise the claimed-mode MQTT
+     * client_id is empty and the broker's identity ACL rejects the session (client_id must == cert CN). */
+    nff_port_get_unique_id(s_hwid, sizeof(s_hwid));
+    g_nff.mode = nff_store_is_claimed() ? NFF_MODE_CLAIMED : NFF_MODE_BOOTSTRAP;
+    if (g_nff.mode == NFF_MODE_CLAIMED) {
+        if (nff_store_load(cfg, &s_loaded) == NFF_OK) {
+            s_loaded.device_id = s_hwid;
+            g_nff.cfg = &s_loaded;
+        } else {
+            g_nff.mode = NFF_MODE_BOOTSTRAP;   /* corrupt NVS → re-enroll */
+        }
+    }
+    if (g_nff.mode == NFF_MODE_BOOTSTRAP) {
+        s_active = *cfg;
+        s_active.device_id = s_hwid;
+        g_nff.cfg = &s_active;
+    }
+#endif
+
     /* Set heartbeat interval from config or default */
     uint32_t hb_s = cfg->heartbeat_interval_s ? cfg->heartbeat_interval_s
                                                : NFF_HEARTBEAT_INTERVAL_S;
@@ -96,11 +130,11 @@ int nff_connect(void) {
     if (!g_nff.cfg) return NFF_ERR_UNINIT;
 
     g_nff.state = NFF_STATE_CONNECTING;
+    /* nff_mqtt_init already opens the MQTT session (with LWT) and subscribes to the cmd topic.
+       Do NOT connect a second time here: a duplicate CONNECT from the same client_id makes the
+       broker tear down the just-subscribed session and open a fresh, unsubscribed one — session
+       churn that left the device flapping (heartbeat once, then drop). */
     nff_mqtt_init();
-    int rc = nff_port_mqtt_connect(g_nff.mqtt, g_nff.cfg->device_id,
-                                   /* LWT built in nff_mqtt_init */ NULL, NULL);
-    /* nff_mqtt_init sets up LWT before calling connect — NULL means "already set" */
-    (void)rc;
 
     if (nff_port_mqtt_is_connected(g_nff.mqtt)) {
         g_nff.state = NFF_STATE_CONNECTED;

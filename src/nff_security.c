@@ -81,6 +81,22 @@ static int build_tbs(const char *payload, size_t plen,
                         version, sha256, nonce, (unsigned long)timestamp);
     }
 
+#if NFF_BOOTSTRAP_ENABLED
+    if (strcmp(action, "rollover_cert") == 0) {
+        /* rollover_cert|{project_id}|{device_id}|{sha256(device_cert_der)}|{nonce}|{timestamp}
+         * Hash the leaf DER (recomputed here from the cert we received) rather than the multi-KB
+         * base64 blob, so the TBS stays in this small buffer and the signature binds the exact cert. */
+        char project[64] = {0};
+        char devid[64]   = {0};
+        char cert_sha[65] = {0};
+        if (nff_json_get_str(payload, plen, "project_id", project, sizeof(project)) != 0) return -1;
+        if (nff_json_get_str(payload, plen, "device_id",  devid,   sizeof(devid))   != 0) return -1;
+        if (nff_claim_cert_sha_hex(payload, plen, cert_sha) != 0) return -1;
+        return snprintf(buf, buf_len, "rollover_cert|%s|%s|%s|%s|%lu",
+                        project, devid, cert_sha, nonce, (unsigned long)timestamp);
+    }
+#endif
+
     return snprintf(buf, buf_len, "%s|%s|%lu",
                     action, nonce, (unsigned long)timestamp);
 }

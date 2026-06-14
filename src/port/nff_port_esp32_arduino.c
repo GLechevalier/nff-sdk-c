@@ -12,6 +12,7 @@
 #include "nff.h"
 #include "nff_port.h"
 #include <Arduino.h>
+#include <WiFi.h>
 #include <WiFiClient.h>
 #include <WiFiClientSecure.h>
 #include <mbedtls/base64.h>
@@ -146,17 +147,38 @@ void nff_port_mqtt_set_server(nff_mqtt_handle_t *hh,
 void nff_port_mqtt_set_tls(nff_mqtt_handle_t *hh,
                             const uint8_t *ca, size_t ca_len,
                             const uint8_t *cert, size_t cert_len,
-                            const uint8_t *key, size_t key_len) {
+                            const uint8_t *key, size_t key_len,
+                            const uint8_t *inter, size_t inter_len) {
     struct nff_mqtt_handle *h = (struct nff_mqtt_handle *)hh;
     free(h->ca_pem);
     free(h->cert_pem);
     free(h->key_pem);
     h->ca_pem   = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", ca,   ca_len);
-    h->cert_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", cert, cert_len);
     h->key_pem  = der_to_pem("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----",  key,  key_len);
+
+    /* Client identity. When a project intermediate is supplied, present leaf + intermediate as one
+       PEM chain: mbedTLS parses concatenated PEM certs into a chain and sends them all in the TLS
+       Certificate message, so a broker that only trusts the root can build leaf -> intermediate ->
+       root. Leaf-only (inter == NULL) preserves the original single-cert behaviour. */
+    h->cert_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", cert, cert_len);
+    if (h->cert_pem && inter && inter_len) {
+        char *inter_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----", inter, inter_len);
+        if (inter_pem) {
+            char *chain = (char *)malloc(strlen(h->cert_pem) + strlen(inter_pem) + 1);
+            if (chain) {
+                strcpy(chain, h->cert_pem);   /* der_to_pem already terminates the leaf with '\n' */
+                strcat(chain, inter_pem);
+                free(h->cert_pem);
+                h->cert_pem = chain;
+            }
+            free(inter_pem);
+        }
+    }
+
     if (h->ca_pem)   h->tls.setCACert(h->ca_pem);
     if (h->cert_pem) h->tls.setCertificate(h->cert_pem);
     if (h->key_pem)  h->tls.setPrivateKey(h->key_pem);
+    h->tls.setHandshakeTimeout(15);   /* DIAG: cap so connect() returns instead of ~120s hang */
     h->tls_configured = true;
 }
 
@@ -183,6 +205,15 @@ int nff_port_mqtt_connect(nff_mqtt_handle_t *hh,
     bool ok = h->client.connect(h->client_id,
                                  "", "",  /* no username/password — mTLS is auth */
                                  h->lwt_topic, 1, true, h->lwt_payload);
+    if (!ok) {
+        /* Surface the cause: a bare reconnect loop is otherwise silent and undiagnosable.
+           PubSubClient state(): -4 timeout, -3 conn lost, -2 connect/TLS failed, -1 disconnected,
+           1..5 MQTT-level rejects; WiFiClientSecure TLS errors surface as -2 with detail here. */
+        char tlserr[96] = {0};
+        h->tls.lastError(tlserr, sizeof(tlserr));
+        nff_log("nff: mqtt connect failed (state=%d wifi=%d tls=%s)",
+                h->client.state(), (int)WiFi.status(), tlserr);
+    }
     return ok ? 0 : -1;
 }
 
@@ -425,6 +456,15 @@ void nff_port_get_hw_info(nff_hw_info_t *out) {
     else if (strstr(model ? model : "", "H2")) t = "esp32h2";
     else if (strstr(model ? model : "", "ESP32")) t = "esp32";
     snprintf(out->device_type, sizeof(out->device_type), "%s", t);
+}
+
+void nff_port_get_unique_id(char *out, size_t out_len) {
+    /* efuse factory MAC (48-bit), lowercase hex, no separators — stable + unique per device. */
+    uint64_t mac = ESP.getEfuseMac();
+    snprintf(out, out_len, "%02x%02x%02x%02x%02x%02x",
+             (unsigned)((mac >> 0)  & 0xff), (unsigned)((mac >> 8)  & 0xff),
+             (unsigned)((mac >> 16) & 0xff), (unsigned)((mac >> 24) & 0xff),
+             (unsigned)((mac >> 32) & 0xff), (unsigned)((mac >> 40) & 0xff));
 }
 
 /* ------------------------------------------------------------------ */

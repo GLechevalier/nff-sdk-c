@@ -388,6 +388,14 @@ void nff_port_get_hw_info(nff_hw_info_t *out) {
     out->cores      = 1;
 }
 
+void nff_port_get_unique_id(char *out, size_t out_len) {
+    /* WiFi station MAC, lowercase hex, no separators — stable + unique per device. */
+    uint8_t mac[6] = {0};
+    WiFi.macAddress(mac);
+    snprintf(out, out_len, "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook (not available on 8266 — UART output only)               */
 /* ------------------------------------------------------------------ */

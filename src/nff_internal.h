@@ -40,6 +40,10 @@ typedef struct {
         void              *user_ctx;
     } cmds[NFF_MAX_USER_CMDS];
     int num_cmds;
+
+#if NFF_BOOTSTRAP_ENABLED
+    nff_mode_t mode;   /* CLAIMED vs BOOTSTRAP, decided at nff_init */
+#endif
 } nff_ctx_t;
 
 extern nff_ctx_t g_nff;
@@ -51,18 +55,38 @@ extern nff_ctx_t g_nff;
 #include <string.h>
 #include <stdio.h>
 
+/* Topics are namespaced by project: nff/{project_id}/devices/{device_id}/{type}. The broker
+ * derives (project_id, device_id) from the verified cert and only permits this namespace. */
 static inline void nff_topic_cmd(const nff_ctx_t *c, char *buf) {
-    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/devices/%s/cmd", c->cfg->device_id);
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/%s/devices/%s/cmd",
+             c->cfg->project_id, c->cfg->device_id);
 }
 static inline void nff_topic_response(const nff_ctx_t *c, char *buf) {
-    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/devices/%s/response", c->cfg->device_id);
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/%s/devices/%s/response",
+             c->cfg->project_id, c->cfg->device_id);
 }
 static inline void nff_topic_heartbeat(const nff_ctx_t *c, char *buf) {
-    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/devices/%s/heartbeat", c->cfg->device_id);
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/%s/devices/%s/heartbeat",
+             c->cfg->project_id, c->cfg->device_id);
 }
 static inline void nff_topic_crash(const nff_ctx_t *c, char *buf) {
-    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/devices/%s/crash", c->cfg->device_id);
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/%s/devices/%s/crash",
+             c->cfg->project_id, c->cfg->device_id);
 }
+
+#if NFF_BOOTSTRAP_ENABLED
+/* Bootstrap (shared batch) namespace: nff/_bootstrap/{batch_id}/{hwid}/{type}. The broker confines
+ * an unclaimed device to exactly this until it rolls over to a unique operational cert. */
+static inline void nff_topic_bootstrap_announce(const nff_ctx_t *c, char *buf) {
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/_bootstrap/%s/%s/announce", c->cfg->batch_id, c->cfg->device_id);
+}
+static inline void nff_topic_bootstrap_cmd(const nff_ctx_t *c, char *buf) {
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/_bootstrap/%s/%s/cmd", c->cfg->batch_id, c->cfg->device_id);
+}
+static inline void nff_topic_bootstrap_response(const nff_ctx_t *c, char *buf) {
+    snprintf(buf, NFF_TOPIC_MAXLEN, "nff/_bootstrap/%s/%s/response", c->cfg->batch_id, c->cfg->device_id);
+}
+#endif
 
 /* ------------------------------------------------------------------ */
 /* Internal module init functions                                       */
@@ -79,6 +103,15 @@ void nff_crash_init(void);  /* install panic hook, check previous boot */
 void nff_crash_check_and_report(void); /* called after MQTT connect */
 
 void nff_cmd_dispatch(const char *topic, const uint8_t *payload, size_t len);
+
+#if NFF_BOOTSTRAP_ENABLED
+/* Claim enrollment (nff_claim.c). */
+void nff_claim_announce(void);
+void nff_claim_handle_rollover(const char *payload, size_t len);
+/* SHA-256 hex of the (base64) device_cert field in a rollover payload; used by the TBS builder so a
+ * rollover_cert signature binds to the exact credentials. Returns 0 on success. */
+int  nff_claim_cert_sha_hex(const char *payload, size_t plen, char out_hex[65]);
+#endif
 
 void nff_ota_check_pending_result(void); /* publish committed/rolled_back if flag set */
 

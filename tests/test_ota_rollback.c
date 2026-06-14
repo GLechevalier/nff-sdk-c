@@ -31,8 +31,11 @@ static const uint8_t NFF_CMD_VERIFY_KEY_DER[] = {0x04,0,0,0,0,0,0,0,0,0,0,0,0,0,
 #define NFF_CLIENT_KEY_LEN   sizeof(NFF_CLIENT_KEY_DER)
 #define NFF_CA_CERT_LEN      sizeof(NFF_CA_CERT_DER)
 #define NFF_CMD_VERIFY_KEY_LEN 65
+static const uint8_t NFF_INTERMEDIATE_CERT_DER[] = {0};
+#define NFF_INTERMEDIATE_CERT_LEN sizeof(NFF_INTERMEDIATE_CERT_DER)
 #define NFF_FW_VERSION "2.0.0"
 #define NFF_BUILD_ID   "aabbccdd11223344"
+#define NFF_PROJECT_ID "test-project"
 
 extern nff_ctx_t g_nff;
 extern void nff_port_posix_reset_nvs(void);
@@ -71,7 +74,7 @@ static void test_pending_committed(void) {
 
     /* Verify the result was published during connect */
     const char *resp = nff_port_posix_get_published(g_nff.mqtt,
-                           "nff/devices/test-device/response");
+                           "nff/test-project/devices/test-device/response");
     assert(resp != NULL);
     assert(strstr(resp, "\"ota_result\"") != NULL);
     assert(strstr(resp, "\"committed\"")  != NULL);
@@ -97,7 +100,7 @@ static void test_pending_rolled_back(void) {
     do_init();  /* publishes ota_result=rolled_back during nff_connect */
 
     const char *resp = nff_port_posix_get_published(g_nff.mqtt,
-                           "nff/devices/test-device/response");
+                           "nff/test-project/devices/test-device/response");
     assert(resp != NULL);
     assert(strstr(resp, "\"rolled_back\"") != NULL);
     assert(g_nff.pending_ota_result == false);
@@ -110,7 +113,7 @@ static void test_no_pending_no_publish(void) {
 
     /* Nothing on the response topic from OTA — connect publishes heartbeat only */
     const char *resp = nff_port_posix_get_published(g_nff.mqtt,
-                           "nff/devices/test-device/response");
+                           "nff/test-project/devices/test-device/response");
     assert(resp == NULL);
     printf("PASS: no pending OTA → nothing published\n");
 }
@@ -121,7 +124,7 @@ static void test_ota_cmd_downgrade_rejected(void) {
     nff_port_posix_clear_published(g_nff.mqtt);
 
     char cmd_topic[128];
-    snprintf(cmd_topic, sizeof(cmd_topic), "nff/devices/test-device/cmd");
+    snprintf(cmd_topic, sizeof(cmd_topic), "nff/test-project/devices/test-device/cmd");
 
     char json[512];
     snprintf(json, sizeof(json),
@@ -138,7 +141,7 @@ static void test_ota_cmd_downgrade_rejected(void) {
     nff_port_posix_inject_mqtt(g_nff.mqtt, cmd_topic, json);
 
     const char *resp = nff_port_posix_get_published(g_nff.mqtt,
-                           "nff/devices/test-device/response");
+                           "nff/test-project/devices/test-device/response");
     assert(resp != NULL);
     assert(strstr(resp, "\"error\"")     != NULL);
     assert(strstr(resp, "downgrade")     != NULL);

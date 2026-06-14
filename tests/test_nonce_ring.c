@@ -30,8 +30,11 @@ static const uint8_t NFF_CMD_VERIFY_KEY_DER[] = {0x04,0,0,0,0,0,0,0,0,0,0,0,0,0,
 #define NFF_CLIENT_KEY_LEN   sizeof(NFF_CLIENT_KEY_DER)
 #define NFF_CA_CERT_LEN      sizeof(NFF_CA_CERT_DER)
 #define NFF_CMD_VERIFY_KEY_LEN 65
+static const uint8_t NFF_INTERMEDIATE_CERT_DER[] = {0};
+#define NFF_INTERMEDIATE_CERT_LEN sizeof(NFF_INTERMEDIATE_CERT_DER)
 #define NFF_FW_VERSION "1.0.0"
 #define NFF_BUILD_ID   "aabbccdd11223344"
+#define NFF_PROJECT_ID "test-project"
 
 /* nff_port_ecdsa_p256_verify override: always accept for these tests */
 int nff_port_ecdsa_p256_verify(const uint8_t *a, const uint8_t *b, size_t c,

@@ -16,6 +16,8 @@ set(NFF_SRCS
     ../src/nff_crash.c
     ../src/nff_diag.c
     ../src/nff_security.c
+    ../src/nff_store.c
+    ../src/nff_claim.c
     ../src/port/nff_port_posix.c
 )
 
@@ -46,3 +48,7 @@ enable_testing()
 add_nff_test(test_nonce_ring)
 add_nff_test(test_cmd_dispatch)
 add_nff_test(test_ota_rollback)
+
+# Claim enrollment test builds the SAME sources WITH the bootstrap feature flag on.
+add_nff_test(test_claim_rollover)
+target_compile_definitions(test_claim_rollover PRIVATE NFF_BOOTSTRAP_ENABLED=1)

@@ -66,11 +66,20 @@ typedef enum {
     NFF_STATE_ERROR
 } nff_state_t;
 
+/* Enrollment mode (DEVICE_OWNERSHIP_DESIGN.md §8). CLAIMED = NVS holds a unique per-device cert;
+ * BOOTSTRAP = unclaimed, using the shared firmware-baked batch credential to announce + await
+ * rollover. Selected at nff_init by probing NVS. */
+typedef enum {
+    NFF_MODE_CLAIMED   = 0,
+    NFF_MODE_BOOTSTRAP = 1
+} nff_mode_t;
+
 /* ------------------------------------------------------------------ */
 /* Configuration                                                        */
 /* ------------------------------------------------------------------ */
 typedef struct {
     const char    *device_id;
+    const char    *project_id;         /* tenant scope (NFF_PROJECT_ID); topics namespace under it */
     const char    *broker_host;
     uint16_t       broker_port;        /* default: 8883 (TLS) */
 
@@ -89,6 +98,12 @@ typedef struct {
 
     /* Tuning */
     uint32_t       heartbeat_interval_s;  /* 0 = use default (30) */
+
+    /* Claim/bootstrap (DEVICE_OWNERSHIP_DESIGN.md §8). Operational configs leave batch_id NULL.
+     * intermediate_cert is the project CA presented alongside the leaf so the broker chains to root
+     * (NULL when unused). In bootstrap mode, cmd_verify_key holds the fleet ROLLOVER-verify key. */
+    const char    *batch_id;                              /* NULL unless bootstrapping */
+    const uint8_t *intermediate_cert;  size_t intermediate_cert_len;
 } nff_config_t;
 
 /* ------------------------------------------------------------------ */
@@ -142,6 +157,7 @@ typedef struct {
 #define NFF_CONFIG(var, id, host)                               \
     nff_config_t var = {                                        \
         (id),                                                   \
+        NFF_PROJECT_ID,                                         \
         (host),                                                 \
         8883,                                                   \
         NFF_CLIENT_CERT_DER,  NFF_CLIENT_CERT_LEN,             \
@@ -151,12 +167,15 @@ typedef struct {
         NFF_FW_VERSION,                                         \
         NFF_BUILD_ID,                                           \
         NFF_FQBN,                                               \
-        30                                                      \
+        30,                                                     \
+        NULL,                                                   \
+        NFF_INTERMEDIATE_CERT_DER, NFF_INTERMEDIATE_CERT_LEN    \
     }
 
 /* ESP-IDF / C99 designated initializer */
 #define NFF_CONFIG_INITIALIZER(id, host) {                      \
     .device_id            = (id),                               \
+    .project_id           = NFF_PROJECT_ID,                     \
     .broker_host          = (host),                             \
     .broker_port          = 8883,                               \
     .client_cert          = NFF_CLIENT_CERT_DER,                \
@@ -171,6 +190,35 @@ typedef struct {
     .build_id             = NFF_BUILD_ID,                       \
     .fqbn                 = NFF_FQBN,                           \
     .heartbeat_interval_s = 30,                                 \
+    .batch_id             = NULL,                               \
+    .intermediate_cert    = NFF_INTERMEDIATE_CERT_DER,          \
+    .intermediate_cert_len = NFF_INTERMEDIATE_CERT_LEN,         \
+}
+
+/* Bootstrap config: the device boots on the SHARED batch credential and pins the fleet ROLLOVER
+ * verify key (not a project key — it has none yet). device_id is left empty; nff_init fills it with
+ * the runtime hardware id (nff_port_get_unique_id) since the firmware image is identical across the
+ * whole batch. Requires a bootstrap credentials.h (NFF_BATCH_ID, NFF_ROLLOVER_VERIFY_KEY_DER, ...). */
+#define NFF_BOOTSTRAP_CONFIG_INITIALIZER(host) {               \
+    .device_id            = "",                                 \
+    .project_id           = NFF_PROJECT_ID,                     \
+    .broker_host          = (host),                             \
+    .broker_port          = 8883,                               \
+    .client_cert          = NFF_CLIENT_CERT_DER,                \
+    .client_cert_len      = NFF_CLIENT_CERT_LEN,                \
+    .client_key           = NFF_CLIENT_KEY_DER,                 \
+    .client_key_len       = NFF_CLIENT_KEY_LEN,                 \
+    .ca_cert              = NFF_CA_CERT_DER,                    \
+    .ca_cert_len          = NFF_CA_CERT_LEN,                    \
+    .cmd_verify_key       = NFF_ROLLOVER_VERIFY_KEY_DER,        \
+    .cmd_verify_key_len   = NFF_ROLLOVER_VERIFY_KEY_LEN,        \
+    .fw_version           = NFF_FW_VERSION,                     \
+    .build_id             = NFF_BUILD_ID,                       \
+    .fqbn                 = NFF_FQBN,                           \
+    .heartbeat_interval_s = 30,                                 \
+    .batch_id             = NFF_BATCH_ID,                       \
+    .intermediate_cert    = NFF_INTERMEDIATE_CERT_DER,          \
+    .intermediate_cert_len = NFF_INTERMEDIATE_CERT_LEN,         \
 }
 
 /* Zephyr: compile-time thread definition (V1: real port deferred — stub only) */
@@ -263,6 +311,20 @@ void nff_log(const char *fmt, ...);
  */
 nff_state_t nff_get_state(void);
 
+#if NFF_BOOTSTRAP_ENABLED
+/**
+ * nff_get_mode — CLAIMED (NVS has a per-device cert) or BOOTSTRAP (unclaimed). Valid after nff_init.
+ */
+nff_mode_t nff_get_mode(void);
+
+/**
+ * nff_bootstrap_run — connect on the shared batch credential, announce this device for enrollment,
+ * and idle until the fleet rolls over a per-device cert (then the device reboots into CLAIMED mode).
+ * Only meaningful when nff_get_mode() == NFF_MODE_BOOTSTRAP.
+ */
+int nff_bootstrap_run(void);
+#endif
+
 /* ------------------------------------------------------------------ */
 /* Compile-time limits (override via -D or Kconfig)                    */
 /* ------------------------------------------------------------------ */
@@ -270,13 +332,29 @@ nff_state_t nff_get_state(void);
 #  define NFF_MAX_USER_CMDS         8
 #endif
 #ifndef NFF_TOPIC_MAXLEN
-#  define NFF_TOPIC_MAXLEN          128
+/* Fits nff/{project_id}/devices/{device_id}/{type} — project_id is a UUID (36 chars). */
+#  define NFF_TOPIC_MAXLEN          192
 #endif
 #ifndef NFF_RESPONSE_MAXLEN
 #  define NFF_RESPONSE_MAXLEN       1024
 #endif
+/* Claim enrollment: gate every bootstrap/rollover/NVS code path. Default off so existing
+ * operational-only builds are byte-for-byte unchanged. Build a bootstrap image with -DNFF_BOOTSTRAP_ENABLED=1. */
+#ifndef NFF_BOOTSTRAP_ENABLED
+#  define NFF_BOOTSTRAP_ENABLED     0
+#endif
+/* Rollover commands carry several DER blobs (base64) and run ~4-6 KB, so a bootstrap build needs a
+ * much larger MQTT RX buffer than the 1 KB operational default (PubSubClient/esp-mqtt silently drop
+ * or truncate oversize PUBLISHes — see NFF_MQTT_BUFFER_SIZE note). */
+#ifndef NFF_ROLLOVER_MQTT_BUFFER_SIZE
+#  define NFF_ROLLOVER_MQTT_BUFFER_SIZE  8192
+#endif
 #ifndef NFF_MQTT_BUFFER_SIZE
-#  define NFF_MQTT_BUFFER_SIZE      1024  /* MQTT RX/TX buffer. OTA cmds are ~400B+ (PubSubClient's 256 default silently drops them). Bump to 2048 for very long pre-signed URLs. */
+#  if NFF_BOOTSTRAP_ENABLED
+#    define NFF_MQTT_BUFFER_SIZE    NFF_ROLLOVER_MQTT_BUFFER_SIZE
+#  else
+#    define NFF_MQTT_BUFFER_SIZE    1024  /* MQTT RX/TX buffer. OTA cmds are ~400B+ (PubSubClient's 256 default silently drops them). Bump to 2048 for very long pre-signed URLs. */
+#  endif
 #endif
 #ifndef NFF_CMD_MAXLEN
 #  define NFF_CMD_MAXLEN            NFF_MQTT_BUFFER_SIZE  /* inbound command parse buffer (nff_cmd_dispatch). Must hold the largest signed command (e.g. an OTA cmd carrying a pre-signed URL); keep >= NFF_MQTT_BUFFER_SIZE so the MQTT layer never delivers more than the parser can hold. */

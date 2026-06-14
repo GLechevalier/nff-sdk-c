@@ -23,6 +23,8 @@ if(DEFINED IDF_TARGET)
             src/nff_crash.c
             src/nff_diag.c
             src/nff_security.c
+            src/nff_store.c
+            src/nff_claim.c
             ${NFF_PORT_FILE}
         INCLUDE_DIRS
             include
@@ -53,6 +55,8 @@ else()
         src/nff_crash.c
         src/nff_diag.c
         src/nff_security.c
+        src/nff_store.c
+        src/nff_claim.c
         src/port/nff_port_posix.c
     )
     target_include_directories(nff PUBLIC include src)

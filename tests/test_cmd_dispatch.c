@@ -32,8 +32,11 @@ static const uint8_t NFF_CMD_VERIFY_KEY_DER[] = {0x04,0,0,0,0,0,0,0,0,0,0,0,0,0,
 #define NFF_CLIENT_KEY_LEN   sizeof(NFF_CLIENT_KEY_DER)
 #define NFF_CA_CERT_LEN      sizeof(NFF_CA_CERT_DER)
 #define NFF_CMD_VERIFY_KEY_LEN 65
+static const uint8_t NFF_INTERMEDIATE_CERT_DER[] = {0};
+#define NFF_INTERMEDIATE_CERT_LEN sizeof(NFF_INTERMEDIATE_CERT_DER)
 #define NFF_FW_VERSION "1.0.0"
 #define NFF_BUILD_ID   "aabbccdd11223344"
+#define NFF_PROJECT_ID "test-project"
 
 extern void nff_security_reset_nonce_ring(void);
 /* Access the global MQTT handle */
@@ -57,7 +60,7 @@ static void my_custom_handler(const char *payload, char *resp, size_t resp_len, 
 static void send_cmd(const char *json) {
     nff_security_reset_nonce_ring();
     char topic[128];
-    snprintf(topic, sizeof(topic), "nff/devices/test-device/cmd");
+    snprintf(topic, sizeof(topic), "nff/test-project/devices/test-device/cmd");
     nff_port_posix_inject_mqtt(g_nff.mqtt, topic, json);
 }
 
@@ -70,7 +73,7 @@ static void test_ping(void) {
     send_cmd(json);
 
     char rtopic[128];
-    snprintf(rtopic, sizeof(rtopic), "nff/devices/test-device/response");
+    snprintf(rtopic, sizeof(rtopic), "nff/test-project/devices/test-device/response");
     const char *resp = nff_port_posix_get_published(g_nff.mqtt, rtopic);
     assert(resp != NULL);
     assert(strstr(resp, "\"pong\"") != NULL);
@@ -86,7 +89,7 @@ static void test_unknown_action(void) {
     send_cmd(json);
 
     char rtopic[128];
-    snprintf(rtopic, sizeof(rtopic), "nff/devices/test-device/response");
+    snprintf(rtopic, sizeof(rtopic), "nff/test-project/devices/test-device/response");
     const char *resp = nff_port_posix_get_published(g_nff.mqtt, rtopic);
     assert(resp != NULL);
     assert(strstr(resp, "\"error\"") != NULL);
@@ -106,7 +109,7 @@ static void test_user_command(void) {
     send_cmd(json);
 
     char rtopic[128];
-    snprintf(rtopic, sizeof(rtopic), "nff/devices/test-device/response");
+    snprintf(rtopic, sizeof(rtopic), "nff/test-project/devices/test-device/response");
     const char *resp = nff_port_posix_get_published(g_nff.mqtt, rtopic);
     assert(resp != NULL);
     assert(strstr(resp, "\"custom_ack\"") != NULL);
@@ -121,7 +124,7 @@ static void test_missing_sig_rejected(void) {
     send_cmd(json);
 
     char rtopic[128];
-    snprintf(rtopic, sizeof(rtopic), "nff/devices/test-device/response");
+    snprintf(rtopic, sizeof(rtopic), "nff/test-project/devices/test-device/response");
     const char *resp = nff_port_posix_get_published(g_nff.mqtt, rtopic);
     assert(resp == NULL);  /* No response published — command silently dropped */
     printf("PASS: command without sig rejected silently\n");
@@ -136,7 +139,7 @@ static void test_diag(void) {
     send_cmd(json);
 
     char rtopic[128];
-    snprintf(rtopic, sizeof(rtopic), "nff/devices/test-device/response");
+    snprintf(rtopic, sizeof(rtopic), "nff/test-project/devices/test-device/response");
     const char *resp = nff_port_posix_get_published(g_nff.mqtt, rtopic);
     assert(resp != NULL);
     assert(strstr(resp, "\"diag\"")     != NULL);

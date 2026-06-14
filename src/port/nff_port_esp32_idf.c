@@ -13,6 +13,7 @@
 #include "freertos/task.h"
 #include "freertos/semphr.h"
 #include "esp_system.h"
+#include "esp_mac.h"
 #include "esp_cpu.h"
 #include "nvs.h"
 #include "nvs_flash.h"
@@ -442,6 +443,14 @@ void nff_port_get_hw_info(nff_hw_info_t *out) {
     uint32_t flash = 0;
     if (esp_flash_get_size(NULL, &flash) != ESP_OK) flash = 0;
     out->flash_size = flash;
+}
+
+void nff_port_get_unique_id(char *out, size_t out_len) {
+    /* efuse-burned factory MAC — stable, unique per device. Lowercase hex, no separators. */
+    uint8_t mac[6] = {0};
+    esp_read_mac(mac, ESP_MAC_WIFI_STA);
+    snprintf(out, out_len, "%02x%02x%02x%02x%02x%02x",
+             mac[0], mac[1], mac[2], mac[3], mac[4], mac[5]);
 }
 
 /* ------------------------------------------------------------------ */

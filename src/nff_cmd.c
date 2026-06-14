@@ -44,9 +44,22 @@ static void handle_reboot(const char *payload, char *resp, size_t resp_len, void
 /* ------------------------------------------------------------------ */
 
 void nff_cmd_dispatch(const char *topic, const uint8_t *payload, size_t len) {
-    (void)topic;
-
     if (!payload || len == 0) return;
+
+    /* Only our own command topic is actionable. The broker is supposed to scope delivery to
+       nff/{project}/devices/{id}/#, but defend in depth: a stray heartbeat / announce / another
+       device's message routed here must NOT be parsed as a command. Each such message otherwise
+       runs a full ECDSA verify (tens of ms) that fails on the missing cmd_sig and spams
+       "cmd rejected (security)" — a flood that starves the MQTT keepalive and knocks the device
+       offline. A cheap topic compare drops foreign traffic before any crypto. */
+    char own_cmd[NFF_TOPIC_MAXLEN];
+#if NFF_BOOTSTRAP_ENABLED
+    if (g_nff.mode == NFF_MODE_BOOTSTRAP) nff_topic_bootstrap_cmd(&g_nff, own_cmd);
+    else                                  nff_topic_cmd(&g_nff, own_cmd);
+#else
+    nff_topic_cmd(&g_nff, own_cmd);
+#endif
+    if (!topic || strcmp(topic, own_cmd) != 0) return;  /* not addressed to this device's cmd topic */
 
     /* Work on a null-terminated copy (payload may not be null-terminated).
        Buffer must hold the largest signed command (OTA cmds carry a pre-signed
@@ -91,6 +104,13 @@ void nff_cmd_dispatch(const char *topic, const uint8_t *payload, size_t len) {
     } else if (strcmp(action, "diag") == 0) {
         extern void nff_diag_handle_cmd(const char *payload, char *resp, size_t resp_len);
         nff_diag_handle_cmd(buf, resp, sizeof(resp));
+#if NFF_BOOTSTRAP_ENABLED
+    } else if (strcmp(action, "rollover_cert") == 0) {
+        /* Claim rollover: persist the per-device cert to NVS, ack, reboot. Publishes its own
+         * response on the bootstrap channel, so return without the generic publish below. */
+        nff_claim_handle_rollover(buf, len);
+        return;
+#endif
     } else {
         /* User-registered commands */
         int found = 0;

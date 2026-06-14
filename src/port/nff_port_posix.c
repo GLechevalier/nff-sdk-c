@@ -413,6 +413,11 @@ void nff_port_get_hw_info(nff_hw_info_t *out) {
     out->cores = 1;
 }
 
+void nff_port_get_unique_id(char *out, size_t out_len) {
+    /* Host build: a fixed mock "MAC". Real ports return the efuse/WiFi MAC. */
+    snprintf(out, out_len, "deadbeef0001");
+}
+
 /* ------------------------------------------------------------------ */
 /* Panic hook                                                           */
 /* ------------------------------------------------------------------ */

@@ -36,7 +36,8 @@ void nff_mqtt_init(void) {
     nff_port_mqtt_set_tls(g_nff.mqtt,
                            g_nff.cfg->ca_cert,    g_nff.cfg->ca_cert_len,
                            g_nff.cfg->client_cert, g_nff.cfg->client_cert_len,
-                           g_nff.cfg->client_key,  g_nff.cfg->client_key_len);
+                           g_nff.cfg->client_key,  g_nff.cfg->client_key_len,
+                           g_nff.cfg->intermediate_cert, g_nff.cfg->intermediate_cert_len);
 
     nff_port_mqtt_set_rx_callback(g_nff.mqtt, mqtt_rx_cb, NULL);
 
@@ -56,8 +57,17 @@ void nff_mqtt_init(void) {
                            lwt_topic, lwt_payload);
 
     if (nff_port_mqtt_is_connected(g_nff.mqtt)) {
-        /* Subscribe to the device's command topic at QoS 1 */
         char cmd_topic[NFF_TOPIC_MAXLEN];
+#if NFF_BOOTSTRAP_ENABLED
+        if (g_nff.mode == NFF_MODE_BOOTSTRAP) {
+            /* Unclaimed: only the bootstrap channel is permitted; announce + await rollover. */
+            nff_topic_bootstrap_cmd(&g_nff, cmd_topic);
+            nff_port_mqtt_subscribe(g_nff.mqtt, cmd_topic, 1);
+            nff_claim_announce();
+            return;
+        }
+#endif
+        /* Subscribe to the device's command topic at QoS 1 */
         nff_topic_cmd(&g_nff, cmd_topic);
         nff_port_mqtt_subscribe(g_nff.mqtt, cmd_topic, 1);
     }

@@ -3,7 +3,8 @@
 gen_credentials.py — Generate credentials.h for an nff device.
 
 Usage (called by `nff provision new-device`):
-    python gen_credentials.py --id device-42 [--ca ca.pem] [--cmd-key cmd_verify.bin]
+    python gen_credentials.py --id device-42 --project <project_id>
+                               [--ca ca.pem] [--cmd-key cmd_verify.bin]
                                [--out credentials.h] [--fw-version 1.0.0]
                                [--build-id aabbccdd11223344]
 
@@ -35,6 +36,11 @@ except ImportError:
     sys.exit(1)
 
 
+# Custom X.509 extension OID carrying the device's project_id (must match
+# nff-fleet/nff_fleet/provisioning/ca.py:NFF_PROJECT_OID).
+NFF_PROJECT_OID = x509.ObjectIdentifier("1.3.6.1.4.1.61226.1.1")
+
+
 def bytes_to_c_array(name: str, data: bytes) -> str:
     """Render a bytes object as a C byte array declaration."""
     hex_vals = ", ".join(f"0x{b:02x}" for b in data)
@@ -53,7 +59,7 @@ def gen_device_keypair():
     return private_key
 
 
-def gen_self_signed_cert(private_key, device_id: str) -> x509.Certificate:
+def gen_self_signed_cert(private_key, device_id: str, project_id: str) -> x509.Certificate:
     """Generate a self-signed certificate (dev only)."""
     subject = issuer = x509.Name([
         x509.NameAttribute(NameOID.COMMON_NAME, device_id),
@@ -69,13 +75,14 @@ def gen_self_signed_cert(private_key, device_id: str) -> x509.Certificate:
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(days=3650))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.UnrecognizedExtension(NFF_PROJECT_OID, project_id.encode()), critical=False)
         .sign(private_key, hashes.SHA256(), default_backend())
     )
     return cert
 
 
-def sign_csr_with_ca(csr, ca_cert_path: str, ca_key_path: str, device_id: str):
-    """Sign the device CSR with the nff CA."""
+def sign_csr_with_ca(csr, ca_cert_path: str, ca_key_path: str, device_id: str, project_id: str):
+    """Sign the device CSR with the nff CA, binding project_id in a signed extension."""
     with open(ca_cert_path, "rb") as f:
         ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
     with open(ca_key_path, "rb") as f:
@@ -91,6 +98,7 @@ def sign_csr_with_ca(csr, ca_cert_path: str, ca_key_path: str, device_id: str):
         .not_valid_before(now)
         .not_valid_after(now + datetime.timedelta(days=3650))
         .add_extension(x509.BasicConstraints(ca=False, path_length=None), critical=True)
+        .add_extension(x509.UnrecognizedExtension(NFF_PROJECT_OID, project_id.encode()), critical=False)
         .sign(ca_key, hashes.SHA256(), default_backend())
     )
     return cert
@@ -99,6 +107,7 @@ def sign_csr_with_ca(csr, ca_cert_path: str, ca_key_path: str, device_id: str):
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--id",         required=True,        help="Device ID (CN of cert)")
+    parser.add_argument("--project",    required=True,        help="Project/tenant ID (bound in signed cert; NFF_PROJECT_ID)")
     parser.add_argument("--ca",         default=None,         help="CA certificate PEM (optional)")
     parser.add_argument("--ca-key",     default=None,         help="CA private key PEM (optional)")
     parser.add_argument("--cmd-key",    default=None,         help="Fleet command-verify public key (65-byte binary)")
@@ -108,6 +117,7 @@ def main():
     args = parser.parse_args()
 
     device_id = args.id
+    project_id = args.project
 
     # Generate device key pair
     private_key = gen_device_keypair()
@@ -119,14 +129,14 @@ def main():
             .subject_name(x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, device_id)]))
             .sign(private_key, hashes.SHA256(), default_backend())
         )
-        cert = sign_csr_with_ca(csr, args.ca, args.ca_key, device_id)
+        cert = sign_csr_with_ca(csr, args.ca, args.ca_key, device_id, project_id)
         with open(args.ca, "rb") as f:
             ca_cert = x509.load_pem_x509_certificate(f.read(), default_backend())
         ca_cert_der = ca_cert.public_bytes(serialization.Encoding.DER)
         print(f"Signed by CA: {args.ca}")
     else:
         # Self-signed dev certificate
-        cert = gen_self_signed_cert(private_key, device_id)
+        cert = gen_self_signed_cert(private_key, device_id, project_id)
         ca_cert_der = cert.public_bytes(serialization.Encoding.DER)
         print("WARNING: Self-signed certificate — NOT for production. Provide --ca and --ca-key.")
 
@@ -157,6 +167,9 @@ def main():
         "#pragma once",
         "#include <stdint.h>",
         "#include <stddef.h>",
+        "",
+        "// Tenant scope (bound in the signed device cert; topics namespace under it)",
+        f'#define NFF_PROJECT_ID "{project_id}"',
         "",
         "// Per-device mTLS client certificate (CN = device_id, DER-encoded)",
         bytes_to_c_array("NFF_CLIENT_CERT_DER", cert_der),

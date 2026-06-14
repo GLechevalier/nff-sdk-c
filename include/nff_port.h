@@ -84,11 +84,17 @@ void nff_port_mqtt_set_server(nff_mqtt_handle_t *h,
 /**
  * Configure mTLS credentials. All buffers are DER-encoded and remain
  * valid for the lifetime of the handle (SDK holds pointers to config).
+ *
+ * `inter` is the OPTIONAL project intermediate CA cert (may be NULL): when present the port must
+ * present the client identity as a leaf -> intermediate chain so a broker that only trusts the
+ * root can build leaf -> intermediate -> root. Required for the batch-claim / per-project-CA path
+ * (DEVICE_OWNERSHIP_DESIGN.md §5 A1); NULL preserves the single-cert (leaf-only) behaviour.
  */
 void nff_port_mqtt_set_tls(nff_mqtt_handle_t *h,
                             const uint8_t *ca,   size_t ca_len,
                             const uint8_t *cert, size_t cert_len,
-                            const uint8_t *key,  size_t key_len);
+                            const uint8_t *key,  size_t key_len,
+                            const uint8_t *inter, size_t inter_len);
 
 /**
  * Register the receive callback. Called from MQTT thread or ISR with
@@ -153,6 +159,17 @@ int nff_port_nvs_set_u32(const char *key, uint32_t value);
 int nff_port_nvs_get_u32(const char *key, uint32_t *out);
 int nff_port_nvs_erase_key(const char *key);
 int nff_port_nvs_commit(void);
+
+/* ------------------------------------------------------------------ */
+/* Unique hardware id                                                   */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Write a stable, per-device unique id (lowercase hex, no separators) to out.
+ * Real ports use the efuse/WiFi MAC (e.g. "a1b2c3d4e5f6"); it is the device's
+ * client_id and the key the fleet dedups/quotas enrollments by during bootstrap.
+ */
+void nff_port_get_unique_id(char *out, size_t out_len);
 
 /* ------------------------------------------------------------------ */
 /* OTA                                                                  */
