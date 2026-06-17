@@ -90,6 +90,127 @@ void nff_ota_check_pending_result(void) {
 }
 
 /* ------------------------------------------------------------------ */
+/* Automatic rollback: trial / confirm / revert                         */
+/* ------------------------------------------------------------------ */
+
+/* Erase the probation record. Result keys (ota_pending/version/committed) are
+   managed separately by commit (none) / rollback (sets them for the old image). */
+static void ota_clear_trial_nvs(void) {
+    nff_port_nvs_erase_key("ota_trial");
+    nff_port_nvs_erase_key("ota_boot_count");
+    nff_port_nvs_commit();
+}
+
+/* The trial image proved healthy: confirm it and report committed. */
+static void nff_ota_commit(void) {
+    nff_port_ota_mark_valid();          /* cancel any pending bootloader rollback */
+    g_nff.ota_marked_valid = true;
+
+    char payload[256];
+    snprintf(payload, sizeof(payload),
+             "{\"type\":\"ota_result\",\"status\":\"committed\","
+             "\"version\":\"%s\",\"id\":\"%s\"}",
+             g_nff.pending_ota_version, g_nff.cfg->device_id);
+    char topic[NFF_TOPIC_MAXLEN];
+    nff_topic_response(&g_nff, topic);
+    nff_port_mqtt_publish(g_nff.mqtt, topic, payload, 1, false);
+
+    ota_clear_trial_nvs();
+    g_nff.ota_trial = false;
+    nff_log("nff: OTA committed v%s", g_nff.pending_ota_version);
+}
+
+/* The trial image failed the health gate (or crash-looped): queue a rolled_back
+   result for the reverted image to publish, then revert the boot partition. */
+static void nff_ota_rollback(const char *reason) {
+    /* The OLD image, after the revert reboot, reads these in nff_init and
+       publishes rolled_back via the existing nff_ota_check_pending_result path. */
+    nff_port_nvs_set_str("ota_pending",   "1");
+    nff_port_nvs_set_str("ota_version",   g_nff.pending_ota_version);
+    nff_port_nvs_set_str("ota_committed", "0");   /* 0 => rolled_back */
+    ota_clear_trial_nvs();                         /* also commits */
+    g_nff.ota_trial = false;
+    nff_log("nff: OTA rollback v%s (%s) — reverting",
+            g_nff.pending_ota_version, reason ? reason : "");
+    nff_port_ota_rollback();   /* revert boot partition + reboot; no return on HW */
+}
+
+/* Called from nff_init. Detects a probation boot, arms the confirm window, or
+   rolls back immediately if the new image keeps rebooting without confirming. */
+void nff_ota_boot_check(void) {
+    char trial[4] = {0};
+    if (nff_port_nvs_get_str("ota_trial", trial, sizeof(trial)) != 0 || trial[0] != '1') {
+        return;   /* not on probation */
+    }
+
+    /* Remember the trial version so commit/rollback can report it. */
+    nff_port_nvs_get_str("ota_version", g_nff.pending_ota_version,
+                         sizeof(g_nff.pending_ota_version));
+
+    /* Crash-loop guard: every unconfirmed boot bumps the counter. */
+    uint32_t boots = 0;
+    nff_port_nvs_get_u32("ota_boot_count", &boots);
+    boots++;
+    nff_port_nvs_set_u32("ota_boot_count", boots);
+    nff_port_nvs_commit();
+
+    if (boots >= NFF_OTA_MAX_TRIAL_BOOTS) {
+        nff_ota_rollback("crash loop");   /* reverts + reboots; no return on HW */
+        return;
+    }
+
+    /* Arm probation; the health gate runs from nff_loop once connected. */
+    g_nff.ota_trial = true;
+    g_nff.ota_health_since_ms = 0;   /* soak starts when the image first reports healthy */
+    g_nff.ota_trial_deadline_ms =
+        nff_port_millis() + (uint32_t)NFF_OTA_CONFIRM_TIMEOUT_S * 1000u;
+    nff_log("nff: OTA trial boot %lu/%d v%s", (unsigned long)boots,
+            NFF_OTA_MAX_TRIAL_BOOTS, g_nff.pending_ota_version);
+}
+
+/* Built-in default health gate (IOT_BRIDGE.md §3 gap #7). Beyond "broker reconnects",
+   require a minimum free-heap floor so an image that connects but is leaking heap is not
+   committed. This is AND'd with any nff_register_health_check() callback — both must pass. */
+static bool nff_ota_default_health_ok(void) {
+    nff_diag_info_t d;
+    nff_port_get_diag_info(&d);
+    return d.min_free_heap >= (uint32_t)NFF_OTA_MIN_HEAP_FLOOR;
+}
+
+/* Called from nff_loop while on probation: commit only after the image holds healthy for the
+   soak window (NFF_OTA_MIN_HEALTHY_MS), else roll back once the confirm window elapses. The
+   soak catches an image that connects then degrades within seconds. */
+void nff_ota_trial_tick(void) {
+    if (!g_nff.ota_trial) return;
+
+    bool connected = nff_port_mqtt_is_connected(g_nff.mqtt);
+    bool healthy   = connected &&
+                     nff_ota_default_health_ok() &&
+                     (g_nff.health_cb == NULL || g_nff.health_cb(g_nff.health_user));
+
+    if (healthy) {
+        uint32_t now = nff_port_millis();
+        if (g_nff.ota_health_since_ms == 0) {
+            g_nff.ota_health_since_ms = now;   /* start the soak (0 reserved for "not yet") */
+            if (g_nff.ota_health_since_ms == 0) g_nff.ota_health_since_ms = 1;
+        }
+        /* Signed compare tolerates nff_port_millis() wraparound. */
+        if ((int32_t)(now - g_nff.ota_health_since_ms) >= (int32_t)NFF_OTA_MIN_HEALTHY_MS) {
+            nff_ota_commit();
+        }
+        return;
+    }
+
+    /* Lost health (or never reached it): restart the soak so it must hold continuously. */
+    g_nff.ota_health_since_ms = 0;
+
+    /* Signed compare tolerates nff_port_millis() wraparound. */
+    if ((int32_t)(nff_port_millis() - g_nff.ota_trial_deadline_ms) >= 0) {
+        nff_ota_rollback("health check timeout");
+    }
+}
+
+/* ------------------------------------------------------------------ */
 /* Main OTA command handler (called from nff_cmd.c)                    */
 /* ------------------------------------------------------------------ */
 
@@ -98,6 +219,14 @@ void nff_ota_handle_cmd(const char *payload, char *resp, size_t resp_len) {
     char url[512]     = {0};
     char sha256hex[65] = {0};
     uint32_t size     = 0;
+
+    /* Refuse a new OTA while a previous image is still on probation — the trial
+       must commit or roll back first, otherwise we'd lose the rollback target. */
+    if (g_nff.ota_trial) {
+        snprintf(resp, resp_len,
+                 "{\"type\":\"error\",\"msg\":\"ota: busy (trial in progress)\"}");
+        return;
+    }
 
     if (nff_json_get_str(payload, strlen(payload), "version", version, sizeof(version)) != 0 ||
         nff_json_get_str(payload, strlen(payload), "url",     url,     sizeof(url))     != 0 ||
@@ -153,16 +282,52 @@ void nff_ota_handle_cmd(const char *payload, char *resp, size_t resp_len) {
     ctx.written = 0;
     ctx.error   = 0;
 
-    int dl_rc = nff_port_https_get_stream(url, ota_chunk_cb, &ctx, 300000 /* 5 min */);
+    /* Resumable download (IOT_BRIDGE.md §3 gap #6): on a transient TLS stall the transfer is
+       retried with an HTTP Range header from where it stopped — the OTA partition keeps
+       appending and the SHA-256 context stays live in RAM across retries, so a dropped transfer
+       does not restart from byte 0. If the server ignored Range (replied 200 to a resume
+       request) the port returns NFF_ERR_RESUME_UNSUPPORTED and we restart the whole download
+       clean: re-begin the partition, reset SHA + byte count. In-session only, not cross-reboot. */
+    int dl_rc = 0;
+    for (int attempt = 0; attempt < NFF_OTA_MAX_DL_RETRIES; attempt++) {
+        if (attempt > 0) {
+            nff_log("nff: OTA download retry %d (resume @%lu)",
+                    attempt, (unsigned long)ctx.written);
+            nff_port_delay_ms(NFF_OTA_DL_RETRY_BACKOFF_MS);
+        }
+
+        dl_rc = nff_port_https_get_stream(url, ctx.written, ota_chunk_cb, &ctx,
+                                          300000 /* 5 min */);
+
+        if (ctx.error != 0) break;                 /* flash write error — not recoverable */
+        if (dl_rc == 0 && (size == 0 || ctx.written >= size)) break;  /* complete */
+
+        if (dl_rc == NFF_ERR_RESUME_UNSUPPORTED) {
+            /* Server can't resume: discard partial progress and start over from scratch. */
+            nff_port_ota_abort(h);
+            nff_port_sha256_free(ctx.sha);
+            h = nff_port_ota_begin((size_t)size);
+            if (h == NFF_OTA_INVALID_HANDLE) { ctx.error = NFF_ERR_OTA; break; }
+            ctx.ota     = h;
+            ctx.sha     = nff_port_sha256_new();
+            ctx.written = 0;
+            ctx.error   = 0;
+            dl_rc       = -1;   /* not done yet; loop continues */
+        }
+        /* else: partial transfer (stall/short read) — loop and resume from ctx.written */
+    }
 
     /* Finalise SHA-256 */
     uint8_t actual_sha[32] = {0};
     nff_port_sha256_finish(ctx.sha, actual_sha);
     nff_port_sha256_free(ctx.sha);
 
-    if (dl_rc != 0 || ctx.error != 0) {
+    bool incomplete = (size != 0 && ctx.written != size);
+    if (dl_rc != 0 || ctx.error != 0 || incomplete) {
         nff_port_ota_abort(h);
-        nff_log("nff: OTA download failed rc=%d", dl_rc ? dl_rc : ctx.error);
+        nff_log("nff: OTA download failed rc=%d written=%lu/%lu",
+                ctx.error ? ctx.error : dl_rc,
+                (unsigned long)ctx.written, (unsigned long)size);
         snprintf(resp, resp_len, "{\"type\":\"error\",\"msg\":\"ota: download failed\"}");
         g_nff.state = NFF_STATE_CONNECTED;
         /* Response already published above; clear for caller */
@@ -191,13 +356,15 @@ void nff_ota_handle_cmd(const char *payload, char *resp, size_t resp_len) {
         return;
     }
 
-    /* Persist OTA result intent to NVS so new firmware can publish it */
-    nff_port_nvs_set_str("ota_pending",   "1");
-    nff_port_nvs_set_str("ota_version",   version);
-    nff_port_nvs_set_str("ota_committed", "1");  /* assume committed; rollback clears */
+    /* Put the new image on probation instead of committing optimistically. The
+       trial record (no ota_pending yet) tells the next boot to run the health
+       gate; commit or rollback decides the final ota_result. See nff_ota_boot_check. */
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    version);
+    nff_port_nvs_set_u32("ota_boot_count", 0);
     nff_port_nvs_commit();
 
-    nff_log("nff: OTA download complete, rebooting");
+    nff_log("nff: OTA download complete, rebooting into trial v%s", version);
 
     /* Small delay to let MQTT ACK flush */
     nff_port_delay_ms(500);

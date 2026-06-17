@@ -33,6 +33,14 @@ typedef struct {
     char                pending_ota_version[32];
     bool                pending_ota_committed; /* true=committed, false=rolled_back */
 
+    /* Automatic OTA rollback: probation state for a freshly-flashed image */
+    bool                ota_trial;             /* true while awaiting the health gate */
+    uint32_t            ota_trial_deadline_ms; /* nff_port_millis() target to commit-or-rollback by */
+    uint32_t            ota_health_since_ms;   /* when the trial image first became healthy (0=not yet); soak window */
+    bool                ota_marked_valid;      /* current image already confirmed valid this boot */
+    nff_health_check_t  health_cb;             /* optional app self-test; NULL = connectivity only */
+    void               *health_user;
+
     /* User command registry */
     struct {
         const char        *name;
@@ -114,6 +122,10 @@ int  nff_claim_cert_sha_hex(const char *payload, size_t plen, char out_hex[65]);
 #endif
 
 void nff_ota_check_pending_result(void); /* publish committed/rolled_back if flag set */
+
+/* Automatic OTA rollback (nff_ota.c) */
+void nff_ota_boot_check(void);  /* at nff_init: arm probation, or roll back a crash-looping image */
+void nff_ota_trial_tick(void);  /* on the loop while on probation: commit when healthy, else roll back */
 
 #ifdef __cplusplus
 }

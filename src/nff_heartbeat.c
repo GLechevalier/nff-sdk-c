@@ -25,7 +25,13 @@ static void publish_heartbeat(void) {
     /* device_type/fqbn/chip let the server gate OTA on real hardware identity
      * (see nff-ota deployment compatibility check). They rarely change, but the
      * heartbeat is retained so the latest values are always available. */
-    char payload[384];
+    /* interval_s declares this device's own heartbeat frequency so the server can
+     * mark it offline after two missed beats (2 × interval) instead of a flat
+     * global timeout — see nff-fleet reaper + the dashboard login reconcile. */
+    uint32_t hb_s = g_nff.cfg->heartbeat_interval_s
+                    ? g_nff.cfg->heartbeat_interval_s
+                    : NFF_HEARTBEAT_INTERVAL_S;
+    char payload[416];
     snprintf(payload, sizeof(payload),
              "{\"status\":\"online\","
              "\"id\":\"%s\","
@@ -37,7 +43,8 @@ static void publish_heartbeat(void) {
              "\"rev\":%u,"
              "\"flash\":%lu,"
              "\"heap\":%lu,"
-             "\"uptime\":%lu}",
+             "\"uptime\":%lu,"
+             "\"interval_s\":%u}",
              g_nff.cfg->device_id,
              g_nff.cfg->fw_version  ? g_nff.cfg->fw_version  : "",
              g_nff.cfg->build_id    ? g_nff.cfg->build_id    : "",
@@ -47,7 +54,8 @@ static void publish_heartbeat(void) {
              (unsigned)hw.revision,
              (unsigned long)hw.flash_size,
              (unsigned long)di.free_heap,
-             (unsigned long)di.uptime_ms);
+             (unsigned long)di.uptime_ms,
+             (unsigned)hb_s);
 
     char topic[NFF_TOPIC_MAXLEN];
     nff_topic_heartbeat(&g_nff, topic);

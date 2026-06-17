@@ -201,6 +201,22 @@ int nff_port_ota_end(nff_ota_handle_t h);
 /** Abort an in-progress OTA session and release resources. */
 void nff_port_ota_abort(nff_ota_handle_t h);
 
+/**
+ * Confirm the currently-running image as valid, cancelling any pending
+ * rollback. Called by the SDK once a freshly-flashed image passes its health
+ * gate, and on any normal (non-trial) boot as belt-and-suspenders against a
+ * rollback-enabled bootloader. Idempotent. Returns 0 on success.
+ * On platforms without A/B rollback (e.g. ESP8266) this is a no-op returning 0.
+ */
+int nff_port_ota_mark_valid(void);
+
+/**
+ * Revert the boot partition to the previous (last-good) image and reboot.
+ * Used by the automatic OTA rollback path. Does not return on real hardware.
+ * On single-image platforms this degrades to a plain reboot.
+ */
+void nff_port_ota_rollback(void);
+
 /** Trigger a system reboot. Does not return. */
 void nff_port_reboot(void);
 
@@ -222,14 +238,21 @@ void             nff_port_sha256_free(nff_sha256_ctx_t ctx);
 /**
  * Perform an HTTPS GET and deliver the response body in chunks.
  *
+ * resume_from — byte offset to resume from. When > 0 the port sends an HTTP
+ *               "Range: bytes=<resume_from>-" header and delivers only the bytes
+ *               [resume_from, total). If the server ignores Range and replies 200
+ *               (full body) while resume_from > 0, the port returns
+ *               NFF_ERR_RESUME_UNSUPPORTED *before* delivering any chunk, so the
+ *               caller can restart the download cleanly without double-writing.
  * chunk_cb    — called repeatedly with successive body chunks;
  *               returning < 0 from chunk_cb aborts the download.
  * user_ctx    — forwarded to chunk_cb unchanged
  * timeout_ms  — overall download timeout (0 = platform default)
- * Returns 0 on success (all chunks delivered, HTTP 200), negative on error.
+ * Returns 0 on success (all requested bytes delivered, HTTP 200/206), negative on error.
  */
 int nff_port_https_get_stream(
         const char *url,
+        size_t resume_from,
         int (*chunk_cb)(const uint8_t *buf, size_t len, void *user_ctx),
         void *user_ctx,
         uint32_t timeout_ms);
@@ -298,6 +321,40 @@ void nff_port_get_hw_info(nff_hw_info_t *out);
  * signal-safe operations. Must be installed at most once.
  */
 void nff_port_install_panic_hook(void (*fn)(const char *reason));
+
+/* ------------------------------------------------------------------ */
+/* Crash fault detail (read at boot, not in panic context)            */
+/* ------------------------------------------------------------------ */
+
+#ifndef NFF_CRASH_BT_MAX
+#  define NFF_CRASH_BT_MAX 16
+#endif
+
+/**
+ * On-device fault detail recovered after a crash. On ESP32 this comes from the
+ * coredump-to-flash summary (esp_core_dump_get_summary) read on the next clean
+ * boot — which works even on the Arduino port where the panic hook can't run.
+ * Fields a platform can't determine are left zero/empty.
+ */
+typedef struct {
+    uint32_t pc;                       /* faulting program counter (0 if unknown) */
+    uint32_t fault_addr;               /* faulting data address (0 if unknown)    */
+    int      exception_cause;          /* exception cause (-1 if unknown)         */
+    char     task_name[16];            /* crashing task ("" if unknown)           */
+    uint32_t backtrace[NFF_CRASH_BT_MAX]; /* return addresses, innermost first    */
+    uint8_t  backtrace_len;            /* valid entries in backtrace[] (0 = none) */
+    bool     valid;                    /* true if a fault summary was recovered   */
+} nff_crash_hw_info_t;
+
+/**
+ * Fill *out with the fault detail from the last crash, if any is stored.
+ * Returns 0 and sets out->valid=true when a summary was found, negative otherwise
+ * (out is always zero-initialised first). Safe to call on a clean boot.
+ */
+int nff_port_get_crash_info(nff_crash_hw_info_t *out);
+
+/** Erase the stored crash image so the next boot doesn't re-report it. */
+void nff_port_crash_info_clear(void);
 
 /* ------------------------------------------------------------------ */
 /* AMP — asymmetric multiprocessing helpers                            */

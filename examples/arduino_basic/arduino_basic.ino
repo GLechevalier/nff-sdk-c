@@ -43,6 +43,23 @@ static void on_led_cmd(const char *payload, char *resp, size_t resp_len, void *c
              "{\"type\":\"led_ack\",\"on\":%s}", on ? "true" : "false");
 }
 
+// ---- Optional but recommended: OTA health check --------------------------
+//
+// After an OTA the new image runs on probation. The SDK already gates commit on
+// "broker reconnected + free heap above a floor + a soak window"; registering a
+// health check adds YOUR application's notion of healthy. Return false until the
+// app is genuinely working — a freshly-flashed image that can't read its sensor
+// or whose heap is collapsing will then be rolled back automatically instead of
+// committed. Must be quick and non-blocking (called every nff_loop while on trial).
+static bool on_health_check(void *ctx) {
+    (void)ctx;
+    // Example: require the app to have a sane heap and a working sensor read.
+    if (ESP.getFreeHeap() < 40000) return false;
+    // bool sensor_ok = (analogRead(34) > 0);   // your real self-test here
+    // if (!sensor_ok) return false;
+    return true;
+}
+
 // --------------------------------------------------------------------------
 
 void setup() {
@@ -71,6 +88,10 @@ void setup() {
 
     // Register custom commands before connecting
     nff_register_command("led", on_led_cmd, NULL);
+
+    // Register the OTA health check before connecting — it gates whether a freshly
+    // flashed image is committed or rolled back (see on_health_check above).
+    nff_register_health_check(on_health_check, NULL);
 
     // Connect to the nff broker (blocking first attempt, retries in loop)
     nff_connect();

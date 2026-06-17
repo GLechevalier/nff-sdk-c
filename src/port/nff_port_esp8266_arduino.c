@@ -17,6 +17,7 @@
 #if defined(ARDUINO) && defined(ESP8266)
 
 #include "nff_port.h"
+#include "nff.h"   /* nff_log */
 #include <Arduino.h>
 #include <ESP8266WiFi.h>
 #include <WiFiClientSecureBearSSL.h>
@@ -298,13 +299,26 @@ void nff_port_ota_abort(nff_ota_handle_t h) {
     s_ota.active = false;
 }
 
+int nff_port_ota_mark_valid(void) {
+    /* ESP8266 has no A/B partition rollback to cancel. No-op. */
+    return 0;
+}
+
+void nff_port_ota_rollback(void) {
+    /* ESP8266 has no second app partition to revert to (single-image OTA via
+       eboot). Best-effort: log and reboot. The previous image is not recoverable
+       in software here — documented limitation; ESP8266 is the secondary port. */
+    nff_log("nff: OTA rollback not supported on ESP8266 (single image) — rebooting");
+    ESP.restart();
+}
+
 void nff_port_reboot(void) { ESP.restart(); }
 
 /* ------------------------------------------------------------------ */
 /* HTTPS streaming                                                      */
 /* ------------------------------------------------------------------ */
 
-int nff_port_https_get_stream(const char *url,
+int nff_port_https_get_stream(const char *url, size_t resume_from,
                                int (*chunk_cb)(const uint8_t *, size_t, void *),
                                void *user_ctx, uint32_t timeout_ms) {
     BearSSL::WiFiClientSecure tls;
@@ -312,8 +326,18 @@ int nff_port_https_get_stream(const char *url,
     HTTPClient http;
     http.begin(tls, url);
     http.setTimeout((int)timeout_ms);
+
+    /* Resume from a previous partial download via an HTTP Range header. */
+    if (resume_from > 0) {
+        char range[40];
+        snprintf(range, sizeof(range), "bytes=%lu-", (unsigned long)resume_from);
+        http.addHeader("Range", range);
+    }
+
     int http_code = http.GET();
-    if (http_code != 200) { http.end(); return -1; }
+    /* A resume request that returns 200 (server ignored Range) would double-write — restart. */
+    if (resume_from > 0 && http_code == 200) { http.end(); return NFF_ERR_RESUME_UNSUPPORTED; }
+    if (http_code != 200 && http_code != 206) { http.end(); return -1; }
 
     WiFiClient *stream = http.getStreamPtr();
     uint8_t buf[256];
@@ -405,6 +429,18 @@ void nff_port_install_panic_hook(void (*fn)(const char *)) {
     /* ESP8266 exception handler is not programmable in Arduino.
        Crash metadata cannot be written to NVS from panic context on 8266. */
 }
+
+/* ------------------------------------------------------------------ */
+/* Crash fault detail — not available on 8266 (no coredump)            */
+/* ------------------------------------------------------------------ */
+
+int nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->exception_cause = -1;
+    return -1;   /* no coredump on ESP8266 — crash report carries RTC log + reason only */
+}
+
+void nff_port_crash_info_clear(void) {}
 
 /* ------------------------------------------------------------------ */
 /* AMP — not available on single-core 8266                             */

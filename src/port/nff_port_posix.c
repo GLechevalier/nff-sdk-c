@@ -10,6 +10,7 @@
 
 #if !defined(ARDUINO) && !defined(ESP_PLATFORM)
 
+#include "nff.h"
 #include "nff_port.h"
 #include <stdlib.h>
 #include <string.h>
@@ -343,21 +344,75 @@ void nff_port_ota_abort(nff_ota_handle_t h) {
     s_ota_active = 0;
 }
 
-static volatile int s_reboot_called = 0;
+static volatile int s_reboot_called      = 0;
+static volatile int s_ota_mark_valid_called = 0;
+static volatile int s_ota_rollback_called   = 0;
+
+int nff_port_ota_mark_valid(void) {
+    s_ota_mark_valid_called = 1;
+    return 0;
+}
+
+void nff_port_ota_rollback(void) {
+    /* In tests, rollback is observed via the flag; simulate the reboot but
+       don't actually exit so the test can drive the next "boot". */
+    s_ota_rollback_called = 1;
+    s_reboot_called       = 1;
+}
+
 void nff_port_reboot(void) {
     s_reboot_called = 1;
     /* In tests, reboot is simulated; don't actually exit */
 }
 
 /* ------------------------------------------------------------------ */
-/* HTTPS streaming — no-op (tests mock OTA directly)                   */
+/* HTTPS streaming — feedable mock (lets tests exercise resume)        */
 /* ------------------------------------------------------------------ */
 
-int nff_port_https_get_stream(const char *url,
+/* Test-controlled response body. When unset, the stream is a no-op returning 0 (preserves the
+   old behaviour for tests that mock OTA at the nff_ota.c layer). */
+static const uint8_t *s_ota_body     = NULL;
+static size_t         s_ota_body_len = 0;
+static size_t         s_ota_drop_at  = 0;   /* >0: drop the first call after delivering this many bytes (from resume_from) */
+static int            s_ota_dropped  = 0;   /* set once the simulated drop has fired */
+static int            s_ota_force_200 = 0;  /* simulate a server that ignores Range (returns 200) */
+
+int nff_port_https_get_stream(const char *url, size_t resume_from,
                                int (*chunk_cb)(const uint8_t *, size_t, void *),
                                void *user_ctx, uint32_t timeout_ms) {
-    (void)url; (void)chunk_cb; (void)user_ctx; (void)timeout_ms;
+    (void)url; (void)timeout_ms;
+    if (!s_ota_body) return 0;   /* no body configured: legacy no-op */
+
+    /* Server ignored Range: report it the first time a resume is attempted. */
+    if (resume_from > 0 && s_ota_force_200) return NFF_ERR_RESUME_UNSUPPORTED;
+    if (resume_from > s_ota_body_len) return -1;
+
+    size_t off = resume_from;
+    while (off < s_ota_body_len) {
+        /* Simulate a mid-stream drop exactly once. */
+        if (s_ota_drop_at > 0 && !s_ota_dropped && off >= s_ota_drop_at) {
+            s_ota_dropped = 1;
+            return -1;   /* transient failure; caller resumes from `off` */
+        }
+        size_t chunk = s_ota_body_len - off;
+        if (chunk > 512) chunk = 512;
+        int rc = chunk_cb(s_ota_body + off, chunk, user_ctx);
+        if (rc < 0) return rc;
+        off += chunk;
+    }
     return 0;
+}
+
+/* Test helpers: configure the mock body / failure injection. */
+void nff_port_posix_set_ota_body(const uint8_t *body, size_t len) {
+    s_ota_body = body; s_ota_body_len = len;
+    s_ota_drop_at = 0; s_ota_dropped = 0; s_ota_force_200 = 0;
+}
+void nff_port_posix_set_ota_drop_at(size_t n) { s_ota_drop_at = n; s_ota_dropped = 0; }
+void nff_port_posix_set_ota_force_200(int on)  { s_ota_force_200 = on ? 1 : 0; }
+void nff_port_posix_reset_ota_body(void) {
+    s_ota_body = NULL; s_ota_body_len = 0;
+    s_ota_drop_at = 0; s_ota_dropped = 0; s_ota_force_200 = 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -399,13 +454,19 @@ int nff_port_ecdsa_p256_verify(const uint8_t *pub_key_65,
 /* System diagnostics                                                   */
 /* ------------------------------------------------------------------ */
 
+/* Test-overridable min_free_heap so the OTA heap-floor gate can be exercised. */
+static uint32_t s_diag_min_heap = 180000;
+
 void nff_port_get_diag_info(nff_diag_info_t *out) {
     out->free_heap     = 200000;
-    out->min_free_heap = 180000;
+    out->min_free_heap = s_diag_min_heap;
     out->uptime_ms     = nff_port_millis();
     out->wifi_rssi     = -55;
     out->cpu_count     = 1;
 }
+
+void nff_port_posix_set_min_heap(uint32_t v) { s_diag_min_heap = v; }
+void nff_port_posix_reset_diag(void)         { s_diag_min_heap = 180000; }
 
 void nff_port_get_hw_info(nff_hw_info_t *out) {
     /* Host build: no real silicon. Leave device_type empty (treated as "unknown"
@@ -433,6 +494,29 @@ void nff_port_install_panic_hook(void (*fn)(const char *)) {
 /* Test helper: simulate a panic */
 void nff_port_posix_trigger_panic(const char *reason) {
     if (s_panic_hook) s_panic_hook(reason);
+}
+
+/* ------------------------------------------------------------------ */
+/* Crash fault detail — test-settable mock (real ports use coredump)   */
+/* ------------------------------------------------------------------ */
+
+static nff_crash_hw_info_t s_crash_hw;   /* zero => valid=false */
+
+int nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    if (!s_crash_hw.valid) return -1;
+    *out = s_crash_hw;
+    return 0;
+}
+
+void nff_port_crash_info_clear(void) {
+    memset(&s_crash_hw, 0, sizeof(s_crash_hw));
+}
+
+/* Test helper: stage a coredump summary the next nff_port_get_crash_info will return. */
+void nff_port_posix_set_crash_info(const nff_crash_hw_info_t *info) {
+    if (info) s_crash_hw = *info;
+    else      memset(&s_crash_hw, 0, sizeof(s_crash_hw));
 }
 
 /* ------------------------------------------------------------------ */
@@ -490,5 +574,13 @@ void nff_port_posix_reset_nvs(void) {
 /** Check whether nff_port_reboot() has been called. */
 int nff_port_posix_reboot_called(void) { return s_reboot_called; }
 void nff_port_posix_reset_reboot(void) { s_reboot_called = 0; }
+
+/** OTA rollback observability for tests. */
+int  nff_port_posix_ota_rollback_called(void)   { return s_ota_rollback_called; }
+int  nff_port_posix_ota_mark_valid_called(void) { return s_ota_mark_valid_called; }
+void nff_port_posix_reset_ota_flags(void) {
+    s_ota_rollback_called   = 0;
+    s_ota_mark_valid_called = 0;
+}
 
 #endif /* !ARDUINO && !ESP_PLATFORM */

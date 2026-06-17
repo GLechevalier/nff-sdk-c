@@ -80,8 +80,27 @@ All OTA rollback tests passed.
 | `pending rolled_back` | NVS contains `ota_pending=1, ota_committed=0` on boot → device publishes `status=rolled_back` |
 | `no pending no publish` | Clean boot (no NVS keys) → nothing published, no false positive |
 | `downgrade rejected` | OTA command targets `v1.0.0` while device is at `v2.0.0` → error response, no download attempted |
+| `trial commit after soak` | Healthy trial image is committed only once it holds healthy for the soak window (`NFF_OTA_MIN_HEALTHY_MS`), not on the first tick |
+| `heap floor veto` | `min_free_heap` below `NFF_OTA_MIN_HEAP_FLOOR` vetoes commit; the image is rolled back at the confirm deadline |
 
 Source: `tests/test_ota_rollback.c`
+
+### Resumable download + crash backtrace (V1.2)
+
+```cmd
+cmd /c build\tests\test_ota_resume.exe
+cmd /c build\tests\test_crash_report.exe
+```
+
+| Test | Simulated scenario |
+|---|---|
+| `resume after drop` (`test_ota_resume.c`) | The HTTPS mock drops mid-stream once; the device resumes via `Range` from the offset and the reassembled image matches the SHA-256 in the signed command → trial armed + reboot |
+| `resume unsupported restart` (`test_ota_resume.c`) | The mock answers a resume request with `200` (ignored Range); the device restarts the download clean (no double-write) and still verifies |
+| `crash report backtrace` (`test_crash_report.c`) | A staged coredump summary + `crash_simulate` boot → retained crash payload carries `pc`/`exception_cause`/`backtrace[]`/`rtc_log`/`fw_version`/`build_id`; `crash_simulate` is erased |
+| `no crash no report` (`test_crash_report.c`) | Clean boot publishes nothing on the crash topic |
+
+> Note: build host tests with **GCC/MinGW**, not MSVC — the POSIX port uses `__attribute__((weak))`
+> for the overridable ECDSA stub, which MSVC rejects.
 
 ---
 

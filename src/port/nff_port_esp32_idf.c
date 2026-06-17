@@ -7,6 +7,7 @@
 
 #if defined(ESP_PLATFORM) && !defined(ARDUINO)
 
+#include "nff.h"
 #include "nff_port.h"
 #include "esp_timer.h"
 #include "freertos/FreeRTOS.h"
@@ -307,6 +308,23 @@ void nff_port_ota_abort(nff_ota_handle_t hh) {
     free(h);
 }
 
+int nff_port_ota_mark_valid(void) {
+    /* Cancel any pending rollback for the running image. Harmless/idempotent on
+       a non-rollback bootloader (returns ESP_ERR_NOT_SUPPORTED → treat as ok). */
+    esp_err_t e = esp_ota_mark_app_valid_cancel_rollback();
+    return (e == ESP_OK || e == ESP_ERR_NOT_SUPPORTED || e == ESP_ERR_INVALID_STATE) ? 0 : -1;
+}
+
+void nff_port_ota_rollback(void) {
+    /* During probation the running partition is the new image; the other OTA
+       slot still holds the previous (last-good) image and is the "next" update
+       partition. Point the bootloader back at it and reboot — works regardless
+       of CONFIG_BOOTLOADER_APP_ROLLBACK_ENABLE. */
+    const esp_partition_t *prev = esp_ota_get_next_update_partition(NULL);
+    if (prev) esp_ota_set_boot_partition(prev);
+    esp_restart();
+}
+
 void nff_port_reboot(void) {
     esp_restart();
 }
@@ -321,11 +339,24 @@ typedef struct {
     int (*chunk_cb)(const uint8_t *, size_t, void *);
     void *user_ctx;
     int   error;
+    size_t resume_from;     /* >0 when this is a resume request */
+    esp_http_client_handle_t client;
+    int    checked_status;  /* 0 until we've validated the status code on first data */
 } https_ctx_t;
 
 static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
     https_ctx_t *ctx = (https_ctx_t *)evt->user_data;
     if (evt->event_id == HTTP_EVENT_ON_DATA && !ctx->error) {
+        /* On the first data event, validate the status. A resume request that comes back as 200
+           (server ignored Range) would double-write the partition — refuse before any chunk. */
+        if (!ctx->checked_status) {
+            ctx->checked_status = 1;
+            if (ctx->resume_from > 0 &&
+                esp_http_client_get_status_code(ctx->client) == 200) {
+                ctx->error = NFF_ERR_RESUME_UNSUPPORTED;
+                return ESP_OK;
+            }
+        }
         int rc = ctx->chunk_cb((const uint8_t *)evt->data,
                                 (size_t)evt->data_len, ctx->user_ctx);
         if (rc < 0) ctx->error = rc;
@@ -333,10 +364,10 @@ static esp_err_t http_event_cb(esp_http_client_event_t *evt) {
     return ESP_OK;
 }
 
-int nff_port_https_get_stream(const char *url,
+int nff_port_https_get_stream(const char *url, size_t resume_from,
                                int (*chunk_cb)(const uint8_t *, size_t, void *),
                                void *user_ctx, uint32_t timeout_ms) {
-    https_ctx_t ctx = { chunk_cb, user_ctx, 0 };
+    https_ctx_t ctx = { chunk_cb, user_ctx, 0, resume_from, NULL, 0 };
     esp_http_client_config_t cfg = {
         .url          = url,
         .event_handler = http_event_cb,
@@ -344,10 +375,20 @@ int nff_port_https_get_stream(const char *url,
         .timeout_ms   = (int)timeout_ms,
     };
     esp_http_client_handle_t client = esp_http_client_init(&cfg);
+    ctx.client = client;
+
+    /* Resume from a previous partial download via an HTTP Range header. */
+    if (resume_from > 0) {
+        char range[40];
+        snprintf(range, sizeof(range), "bytes=%lu-", (unsigned long)resume_from);
+        esp_http_client_set_header(client, "Range", range);
+    }
+
     esp_err_t err = esp_http_client_perform(client);
     esp_http_client_cleanup(client);
+    if (ctx.error) return ctx.error;     /* includes NFF_ERR_RESUME_UNSUPPORTED */
     if (err != ESP_OK) return -1;
-    return ctx.error;
+    return 0;
 }
 
 /* ------------------------------------------------------------------ */
@@ -476,6 +517,54 @@ void nff_port_install_panic_hook(void (*fn)(const char *)) {
     s_panic_hook = fn;
     esp_set_panic_handler(nff_esp_panic_handler);
 }
+
+/* ------------------------------------------------------------------ */
+/* Crash fault detail — from the coredump-to-flash summary             */
+/* ------------------------------------------------------------------ */
+
+/* Requires CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH + ELF format in sdkconfig (add a coredump
+ * partition). esp_core_dump_get_summary() returns the fault PC + backtrace recovered at boot —
+ * no panic-context work and no ELF parsing on-device. */
+#if defined(CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH)
+#include "esp_core_dump.h"
+
+int nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->exception_cause = -1;
+
+    esp_core_dump_summary_t *s =
+        (esp_core_dump_summary_t *)malloc(sizeof(esp_core_dump_summary_t));
+    if (!s) return -1;
+
+    int rc = -1;
+    if (esp_core_dump_get_summary(s) == ESP_OK) {
+        out->pc = s->exc_pc;
+        snprintf(out->task_name, sizeof(out->task_name), "%s", s->exc_task);
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
+        out->exception_cause = (int)s->ex_info.exc_cause;
+        out->fault_addr      = s->ex_info.exc_vaddr;
+#endif
+        uint32_t depth = s->exc_bt_info.depth;
+        if (depth > NFF_CRASH_BT_MAX) depth = NFF_CRASH_BT_MAX;
+        for (uint32_t i = 0; i < depth; i++) out->backtrace[i] = s->exc_bt_info.bt[i];
+        out->backtrace_len = (uint8_t)depth;
+        out->valid = true;
+        rc = 0;
+    }
+    free(s);
+    return rc;
+}
+
+void nff_port_crash_info_clear(void) { esp_core_dump_image_erase(); }
+
+#else  /* coredump disabled in this build */
+
+int  nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out)); out->exception_cause = -1; return -1;
+}
+void nff_port_crash_info_clear(void) {}
+
+#endif
 
 /* ------------------------------------------------------------------ */
 /* AMP                                                                  */

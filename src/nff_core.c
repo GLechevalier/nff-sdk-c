@@ -99,7 +99,13 @@ int nff_init(const nff_config_t *cfg) {
                                                : NFF_HEARTBEAT_INTERVAL_S;
     g_nff.heartbeat_next_ms = nff_port_millis() + hb_s * 1000;
 
-    /* Check for pending OTA result from previous boot */
+    /* Automatic OTA rollback: if the previous boot flashed a new image, this
+       either arms its probation window or — if it crash-looped — reverts the
+       boot partition and reboots now (does not return on hardware). */
+    nff_ota_boot_check();
+
+    /* Check for pending OTA result from previous boot (committed by the new
+       image, or rolled_back queued by nff_ota_boot_check for the reverted one) */
     char pending[4] = {0};
     if (nff_port_nvs_get_str("ota_pending", pending, sizeof(pending)) == 0) {
         g_nff.pending_ota_result = true;
@@ -141,6 +147,14 @@ int nff_connect(void) {
         nff_heartbeat_on_connect();
         nff_crash_check_and_report();
         nff_ota_check_pending_result();
+        /* Belt-and-suspenders: confirm the running image valid on any normal
+           (non-trial) connected boot, so a rollback-enabled bootloader can't
+           independently revert it. The trial path withholds this until its
+           health gate passes (see nff_ota_trial_tick). */
+        if (!g_nff.ota_trial && !g_nff.ota_marked_valid) {
+            nff_port_ota_mark_valid();
+            g_nff.ota_marked_valid = true;
+        }
         reset_backoff();
     } else {
         advance_backoff();
@@ -159,6 +173,9 @@ void nff_loop(void) {
 
     if (g_nff.state == NFF_STATE_CONNECTED) {
         nff_heartbeat_tick();
+        if (g_nff.ota_trial) {
+            nff_ota_trial_tick();   /* commit a healthy trial image, or roll back */
+        }
     }
 }
 
@@ -200,6 +217,18 @@ int nff_register_command(const char *name, nff_cmd_handler_t handler, void *user
 }
 
 /* ------------------------------------------------------------------ */
+/* nff_register_health_check                                            */
+/* ------------------------------------------------------------------ */
+
+int nff_register_health_check(nff_health_check_t cb, void *user_ctx) {
+    nff_port_mutex_lock(g_nff.lock);
+    g_nff.health_cb   = cb;
+    g_nff.health_user = user_ctx;
+    nff_port_mutex_unlock(g_nff.lock);
+    return NFF_OK;
+}
+
+/* ------------------------------------------------------------------ */
 /* nff_log                                                              */
 /* ------------------------------------------------------------------ */
 
@@ -220,5 +249,10 @@ void nff_log(const char *fmt, ...) {
 /* ------------------------------------------------------------------ */
 
 nff_state_t nff_get_state(void) {
+    /* Surface probation distinctly while the connectivity/heartbeat machinery
+       internally keeps state == CONNECTED during the trial window. */
+    if (g_nff.ota_trial && g_nff.state == NFF_STATE_CONNECTED) {
+        return NFF_STATE_OTA_TRIAL;
+    }
     return g_nff.state;
 }

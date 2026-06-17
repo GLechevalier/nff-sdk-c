@@ -54,6 +54,7 @@ extern "C" {
 #define NFF_ERR_TIMEOUT        (-8)
 #define NFF_ERR_DOWNGRADE      (-9)
 #define NFF_ERR_CHECKSUM       (-10)
+#define NFF_ERR_RESUME_UNSUPPORTED (-11)  /* server ignored Range (sent 200 to a resume request) */
 
 /* ------------------------------------------------------------------ */
 /* SDK state                                                            */
@@ -63,6 +64,7 @@ typedef enum {
     NFF_STATE_CONNECTING,
     NFF_STATE_CONNECTED,
     NFF_STATE_OTA_ACTIVE,
+    NFF_STATE_OTA_TRIAL,   /* a freshly-flashed image is on probation, awaiting the health gate */
     NFF_STATE_ERROR
 } nff_state_t;
 
@@ -243,6 +245,18 @@ typedef void (*nff_cmd_handler_t)(const char  *payload,
                                    size_t       response_len,
                                    void        *user_ctx);
 
+/**
+ * Optional health-check callback for OTA rollback. After an OTA the new image
+ * runs on probation; the SDK commits it (cancels rollback) once MQTT reconnects
+ * AND this callback — if registered — returns true. Returning false, or never
+ * returning true before NFF_OTA_CONFIRM_TIMEOUT_S elapses, makes the device
+ * automatically revert to the previous image and report "rolled_back".
+ *
+ * Called repeatedly on the nff loop/task while on probation. Must be
+ * non-blocking. user_ctx is the value passed to nff_register_health_check.
+ */
+typedef bool (*nff_health_check_t)(void *user_ctx);
+
 /* ------------------------------------------------------------------ */
 /* Public API                                                           */
 /* ------------------------------------------------------------------ */
@@ -296,6 +310,15 @@ int nff_start_task(void);
 int nff_register_command(const char      *name,
                           nff_cmd_handler_t handler,
                           void             *user_ctx);
+
+/**
+ * nff_register_health_check — register an optional OTA self-test callback.
+ *
+ * Used by the automatic OTA rollback gate (see nff_health_check_t). Pass NULL
+ * cb to clear. When unset, the gate uses broker reconnect alone. Returns NFF_OK.
+ * Must be called before nff_connect().
+ */
+int nff_register_health_check(nff_health_check_t cb, void *user_ctx);
 
 /**
  * nff_log — write a formatted log line to the RTC circular buffer and UART.
@@ -376,6 +399,35 @@ int nff_bootstrap_run(void);
 #endif
 #ifndef NFF_TIMESTAMP_WINDOW_S
 #  define NFF_TIMESTAMP_WINDOW_S    300  /* ±5 minutes */
+#endif
+/* Automatic OTA rollback (IOT_BRIDGE.md §3). A freshly-flashed image runs on
+ * probation; it is committed only once it reconnects to the broker (and any
+ * registered health-check passes) within the confirm window, else the device
+ * reverts to the previous image. */
+#ifndef NFF_OTA_CONFIRM_TIMEOUT_S
+#  define NFF_OTA_CONFIRM_TIMEOUT_S 60   /* time to prove healthy before rollback */
+#endif
+#ifndef NFF_OTA_MAX_TRIAL_BOOTS
+#  define NFF_OTA_MAX_TRIAL_BOOTS   3    /* unconfirmed boots tolerated before rollback (crash-loop guard) */
+#endif
+/* Resumable OTA download (IOT_BRIDGE.md §3 gap #6). A transient TLS stall mid-download is
+ * retried with an HTTP Range header from where it stopped (SHA-256 context kept in RAM), so a
+ * dropped transfer on flaky cellular does not restart from byte 0. In-session only — not
+ * persisted across reboots. */
+#ifndef NFF_OTA_MAX_DL_RETRIES
+#  define NFF_OTA_MAX_DL_RETRIES    4    /* download attempts before giving up the OTA */
+#endif
+#ifndef NFF_OTA_DL_RETRY_BACKOFF_MS
+#  define NFF_OTA_DL_RETRY_BACKOFF_MS 2000  /* delay between resume attempts */
+#endif
+/* Deeper default OTA health gate (IOT_BRIDGE.md §3 gap #7). Beyond "broker reconnects", the SDK
+ * requires a minimum free-heap floor AND that the new image stays healthy for a soak window
+ * before committing. Both are AND'd with any nff_register_health_check() callback. */
+#ifndef NFF_OTA_MIN_HEAP_FLOOR
+#  define NFF_OTA_MIN_HEAP_FLOOR    20000  /* bytes; min_free_heap must stay above this to commit */
+#endif
+#ifndef NFF_OTA_MIN_HEALTHY_MS
+#  define NFF_OTA_MIN_HEALTHY_MS    5000   /* image must hold healthy this long before commit (soak) */
 #endif
 
 #ifdef __cplusplus

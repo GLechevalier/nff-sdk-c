@@ -48,6 +48,10 @@ enable_testing()
 add_nff_test(test_nonce_ring)
 add_nff_test(test_cmd_dispatch)
 add_nff_test(test_ota_rollback)
+add_nff_test(test_ota_resume)
+# Keep the retry backoff tiny so the resume test runs fast (default is 2 s/attempt).
+target_compile_definitions(test_ota_resume PRIVATE NFF_OTA_DL_RETRY_BACKOFF_MS=5)
+add_nff_test(test_crash_report)
 
 # Claim enrollment test builds the SAME sources WITH the bootstrap feature flag on.
 add_nff_test(test_claim_rollover)

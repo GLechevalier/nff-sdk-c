@@ -44,6 +44,23 @@ extern const char *nff_port_posix_get_published(nff_mqtt_handle_t *h, const char
 extern void nff_security_reset_nonce_ring(void);
 extern void nff_ota_check_pending_result(void);
 
+/* Automatic-rollback test hooks (nff_port_posix.c) */
+extern int  nff_port_posix_ota_rollback_called(void);
+extern int  nff_port_posix_ota_mark_valid_called(void);
+extern void nff_port_posix_reset_ota_flags(void);
+
+/* Health-gate test hooks (nff_port_posix.c) */
+extern void nff_port_posix_set_min_heap(uint32_t v);
+extern void nff_port_posix_reset_diag(void);
+
+static bool health_always_false(void *u) { (void)u; return false; }
+static bool health_always_true(void *u)  { (void)u; return true; }
+
+/* Fast-forward the soak window so the next tick can commit (the soak must already be armed). */
+static void elapse_soak(void) {
+    g_nff.ota_health_since_ms = nff_port_millis() - (NFF_OTA_MIN_HEALTHY_MS + 1);
+}
+
 /* Initialise without resetting NVS — call after populating NVS to simulate a reboot */
 static void do_init(void) {
     nff_security_reset_nonce_ring();
@@ -148,11 +165,182 @@ static void test_ota_cmd_downgrade_rejected(void) {
     printf("PASS: OTA downgrade rejected\n");
 }
 
+/* ---- Automatic rollback: trial / confirm / revert -------------------- */
+
+static const char *RESP_TOPIC =
+    "nff/test-project/devices/test-device/response";
+
+/* A healthy trial image (connects, no health veto) commits and reports committed. */
+static void test_trial_commit_on_connect(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "2.1.0");
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();                 /* boot_check arms probation; connect does NOT mark valid yet */
+    assert(g_nff.ota_trial == true);
+    assert(nff_port_posix_ota_mark_valid_called() == 0);
+
+    nff_port_posix_clear_published(g_nff.mqtt);
+    nff_loop();                /* connected + heap ok, but soak not yet elapsed -> hold */
+    assert(g_nff.ota_trial == true);
+    assert(nff_port_posix_ota_mark_valid_called() == 0);
+    assert(g_nff.ota_health_since_ms != 0);   /* soak armed */
+
+    elapse_soak();
+    nff_loop();                /* soak elapsed -> commit */
+
+    const char *resp = nff_port_posix_get_published(g_nff.mqtt, RESP_TOPIC);
+    assert(resp != NULL);
+    assert(strstr(resp, "\"ota_result\"") != NULL);
+    assert(strstr(resp, "\"committed\"")  != NULL);
+    assert(strstr(resp, "2.1.0")          != NULL);
+    assert(nff_port_posix_ota_mark_valid_called() == 1);
+    assert(nff_port_posix_ota_rollback_called()   == 0);
+    assert(g_nff.ota_trial == false);
+
+    char val[8] = {0};
+    assert(nff_port_nvs_get_str("ota_trial", val, sizeof(val)) != 0);  /* erased */
+    printf("PASS: healthy trial image commits after soak + reports committed\n");
+}
+
+/* A trial image that never becomes healthy within the window rolls back, and the
+   reverted image then reports rolled_back on its next boot. */
+static void test_trial_rollback_on_timeout(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "3.0.0");
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();
+    assert(g_nff.ota_trial == true);
+
+    nff_register_health_check(health_always_false, NULL);
+    g_nff.ota_trial_deadline_ms = nff_port_millis() - 1;  /* window already elapsed */
+
+    nff_loop();                /* not healthy + past deadline -> rollback */
+    assert(nff_port_posix_ota_rollback_called() == 1);
+    assert(g_nff.ota_trial == false);
+
+    char committed[8] = {0}, pending[8] = {0};
+    nff_port_nvs_get_str("ota_committed", committed, sizeof(committed));
+    nff_port_nvs_get_str("ota_pending",   pending,   sizeof(pending));
+    assert(committed[0] == '0');
+    assert(pending[0]   == '1');
+
+    /* Simulate the reverted image booting: it reports rolled_back. */
+    nff_port_posix_clear_published(g_nff.mqtt);
+    do_init();                 /* boot_check no-op (trial erased); pending block -> rolled_back */
+    const char *resp = nff_port_posix_get_published(g_nff.mqtt, RESP_TOPIC);
+    assert(resp != NULL);
+    assert(strstr(resp, "\"rolled_back\"") != NULL);
+    assert(strstr(resp, "3.0.0")           != NULL);
+    printf("PASS: unhealthy trial image rolls back + reports rolled_back\n");
+}
+
+/* A trial image that keeps rebooting without confirming is rolled back by the
+   crash-loop guard the moment the boot counter crosses the threshold. */
+static void test_trial_rollback_on_bootloop(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "3.0.0");
+    nff_port_nvs_set_u32("ota_boot_count", NFF_OTA_MAX_TRIAL_BOOTS - 1);
+    nff_port_nvs_commit();
+
+    /* boot_check increments to the threshold and rolls back inside nff_init;
+       because the POSIX rollback doesn't actually reboot, nff_init then consumes
+       the queued result and connect publishes rolled_back in the same pass. */
+    nff_port_posix_clear_published(g_nff.mqtt);
+    do_init();
+    assert(nff_port_posix_ota_rollback_called() == 1);
+    assert(g_nff.ota_trial == false);
+
+    const char *resp = nff_port_posix_get_published(g_nff.mqtt, RESP_TOPIC);
+    assert(resp != NULL);
+    assert(strstr(resp, "\"rolled_back\"") != NULL);
+    printf("PASS: crash-looping trial image rolls back via boot-count guard\n");
+}
+
+/* A health-check veto before the deadline keeps the image on probation — no
+   premature commit and no premature rollback. */
+static void test_trial_health_veto_holds(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "2.2.0");
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();
+    nff_register_health_check(health_always_false, NULL);
+    /* deadline left in the future (armed at boot_check) */
+
+    nff_port_posix_clear_published(g_nff.mqtt);
+    nff_loop();                /* connected but vetoed, before deadline -> hold */
+
+    assert(g_nff.ota_trial == true);
+    assert(nff_port_posix_ota_rollback_called()   == 0);
+    assert(nff_port_posix_ota_mark_valid_called() == 0);
+    assert(nff_port_posix_get_published(g_nff.mqtt, RESP_TOPIC) == NULL);
+
+    char val[8] = {0};
+    assert(nff_port_nvs_get_str("ota_trial", val, sizeof(val)) == 0 && val[0] == '1');
+
+    /* Once the app reports healthy, the soak arms and then the next tick commits. */
+    nff_register_health_check(health_always_true, NULL);
+    nff_loop();                /* arms soak (was reset by the veto) */
+    assert(g_nff.ota_trial == true);
+    elapse_soak();
+    nff_loop();
+    assert(g_nff.ota_trial == false);
+    assert(nff_port_posix_ota_mark_valid_called() == 1);
+    printf("PASS: health-check veto holds probation, then commits when healthy\n");
+}
+
+/* The default deeper health gate (heap floor) vetoes commit when min_free_heap is below the
+   floor; the image is then rolled back when the confirm window elapses. */
+static void test_trial_heap_floor_veto(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "2.3.0");
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();
+    assert(g_nff.ota_trial == true);
+
+    nff_port_posix_set_min_heap(NFF_OTA_MIN_HEAP_FLOOR - 1);  /* below the floor */
+    nff_port_posix_clear_published(g_nff.mqtt);
+    nff_loop();                /* connected but heap too low -> hold, soak never arms */
+    assert(g_nff.ota_trial == true);
+    assert(nff_port_posix_ota_mark_valid_called() == 0);
+    assert(g_nff.ota_health_since_ms == 0);
+
+    g_nff.ota_trial_deadline_ms = nff_port_millis() - 1;  /* window elapsed */
+    nff_loop();                /* still unhealthy + past deadline -> rollback */
+    assert(nff_port_posix_ota_rollback_called() == 1);
+    assert(g_nff.ota_trial == false);
+
+    nff_port_posix_reset_diag();
+    printf("PASS: low heap vetoes commit, then rolls back at deadline\n");
+}
+
 int main(void) {
     test_pending_committed();
     test_pending_rolled_back();
     test_no_pending_no_publish();
     test_ota_cmd_downgrade_rejected();
+    test_trial_commit_on_connect();
+    test_trial_rollback_on_timeout();
+    test_trial_rollback_on_bootloop();
+    test_trial_health_veto_holds();
+    test_trial_heap_floor_veto();
 
     printf("All OTA rollback tests passed.\n");
     return 0;

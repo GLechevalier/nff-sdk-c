@@ -1,5 +1,46 @@
 # What changed
 
+## Feature — OTA hardening: resumable download, deeper health gate, panic backtrace (2026-06-15)
+
+Implements three of the IOT_BRIDGE.md §3 "remaining work to make OTA production-grade" gaps
+(#6, #7, #8). All device-side in `nff-sdk-c`; covered by host unit tests (POSIX port). No server
+change was needed — the crash payload now matches the schema nff-fleet/nff-mock already expect.
+
+1. **Resumable OTA download (gap #6).** `nff_port_https_get_stream` gained a `resume_from`
+   parameter; the OTA handler (`nff_ota.c`) now wraps the download in a bounded retry loop
+   (`NFF_OTA_MAX_DL_RETRIES`, `NFF_OTA_DL_RETRY_BACKOFF_MS`). On a transient TLS stall it retries
+   with an HTTP `Range: bytes=N-` header from where it stopped — the OTA partition keeps
+   appending and the SHA-256 context stays live in RAM, so a dropped transfer no longer restarts
+   from byte 0. If the server ignores `Range` and replies `200`, the port returns the new
+   `NFF_ERR_RESUME_UNSUPPORTED` *before delivering any chunk* and the handler restarts clean (no
+   double-write). In-session only — not persisted across reboots. All four ports updated.
+
+2. **Deeper default health gate (gap #7).** The trial-commit gate was "broker reconnects". It now
+   also requires `min_free_heap >= NFF_OTA_MIN_HEAP_FLOOR` **and** that the image holds healthy
+   for a soak window (`NFF_OTA_MIN_HEALTHY_MS`) before committing — both AND'd with any
+   `nff_register_health_check()` callback. Catches an image that connects but is leaking heap or
+   degrades within seconds. Examples updated to register a real health check.
+
+3. **Panic-hook backtrace (gap #8).** A rolled-back image used to report no fault detail (the
+   Arduino panic hook is a no-op). New port primitives `nff_port_get_crash_info` /
+   `nff_port_crash_info_clear` read the **coredump-to-flash summary** (`esp_core_dump_get_summary`)
+   at boot — which works on the Arduino port too, since it runs at boot not in panic context, and
+   needs no partition/sdkconfig change (arduino-esp32's default build already enables ELF
+   coredump-to-flash). The crash report (`nff_crash.c`) now carries `pc`, `exception_cause`,
+   `fault_addr`, `task_name`, `backtrace[]`, and `fw_version`/`build_id`, and emits `rtc_log` as
+   objects (`[{"message":"…"}]`) instead of `pre_crash_logs` — matching `nff-fleet`'s
+   `db.ingest_crash` so `crash_reports` + `backtrace_frames` + `rtc_log_lines` all populate. The
+   crash counter is now incremented at boot (single source of truth, works without a panic hook).
+
+New host tests: `tests/test_ota_resume.c` (drop-then-resume + Range-ignored restart), 
+`tests/test_crash_report.c` (backtrace + schema), and soak/heap-floor cases added to
+`tests/test_ota_rollback.c`. Build + run with `cmake -S tests -B build && cmake --build build &&
+ctest --test-dir build` (the project builds host tests with GCC/MinGW, not MSVC — MSVC rejects the
+POSIX port's `__attribute__((weak))`).
+
+**Still pending** (unchanged): real-hardware revert validation, firmware image signing / Secure
+Boot V2, phased/canary rollout, rate limiting, TLS pinning on the download.
+
 ## Status — batch-claim enrollment verified end-to-end on real hardware (2026-06-14)
 
 The §8 device-initiated batch-claim flow (DEVICE_OWNERSHIP_DESIGN.md) now works end-to-end on a

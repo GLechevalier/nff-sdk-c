@@ -37,6 +37,94 @@ The SDK maintains a second MQTT connection to the nff broker running alongside y
 
 ---
 
+## Footprint
+
+Measured on **ESP32 (xtensa, `-Os`)** with `size` over the compiled objects. These are the
+SDK's **own** code and static RAM only. The heavyweight stacks it rides on — TLS (mbedTLS),
+MQTT (PubSubClient), OTA (`Update`/`esp_https_ota`), WiFi — are **shared** with firmware that
+already uses them and are **not** counted here. They are what make a *full* firmware image ~1 MB;
+nff itself is a ~23 KB slice riding inside that.
+
+| Module | Flash (text+data) | Static RAM (bss) | Required? | Cutting it also drops |
+|---|--:|--:|---|---|
+| `nff_core` | 1.0 KB | 0.3 KB | ✅ core | — |
+| `nff_mqtt` | 1.0 KB | 0.3 KB | ✅ core | (glue only; PubSubClient is separate) |
+| `nff_cmd` | 1.4 KB | 9.2 KB | ✅ core | — |
+| `nff_security` | 1.7 KB | 0.2 KB | ✅ core | (mbedTLS ECDSA — usually already linked) |
+| `nff_store` | 1.9 KB | — | ✅ core | NVS/Preferences |
+| port (`esp32_arduino`) | 5.3 KB | — | ✅ core¹ | — |
+| `nff_heartbeat` | 0.6 KB | — | ◐ recommended | retained presence |
+| `nff_ota` | 2.5 KB | — | ○ optional | **`Update` + `HTTPClient` + `esp_https_ota`** (tens of KB) |
+| `nff_crash` | 5.3 KB | 6.3 KB | ○ optional | `esp_core_dump` (incl. a 4 KB report buffer) |
+| `nff_claim` | 2.0 KB | 8.2 KB | ○ optional | field-claim/bootstrap path |
+| `nff_diag` | 0.2 KB | — | ○ optional | — |
+| **Full SDK** | **~23 KB** | **~24 KB** | | |
+
+¹ A port is always required, but exactly **one** is linked per build — `esp32_arduino`,
+`esp32_idf`, `esp8266_arduino`, or `posix` (host tests). They are mutually exclusive, so this
+is the per-platform port tax, not an additive cost; the 5.3 KB is the ESP32-Arduino figure
+(other ports differ — ESP8266 uses BearSSL).
+
+### Profiles — what you can save
+
+| Profile | Modules kept | Flash | Static RAM |
+|---|---|--:|--:|
+| **Full** | everything | ~23 KB | ~24 KB |
+| **Telemetry-only** | core + mqtt + cmd + security + store + heartbeat + port | **~13 KB** | **~10 KB** |
+| **+ build flags** | any profile, `-ffunction-sections -fdata-sections -Wl,--gc-sections` + LTO | −10–20% | — |
+
+Further savings:
+- **RAM:** the `Kconfig` tuning knobs trim static RAM — e.g. `NFF_LOG_LINES 32→8` saves ~3 KB,
+  a smaller `NFF_NONCE_RING_SIZE` a bit more. Near-zero flash impact.
+- **Bare (non-Espressif) MCUs:** `nff_security` pulls mbedTLS ECC. On ESP32 that's effectively
+  free (already in the IDF/ROM, shared with WiFi); on a bare MCU it's 100 KB+, so trim mbedTLS's
+  own config (drop unused ciphersuites/curves) to claw back 50–100 KB.
+
+### Dependency footprint — the stacks nff rides on
+
+This is where the bytes actually are. nff is ~23 KB, but it depends on MQTT, TLS, OTA, WiFi and
+NVS libraries that are **far larger**. The table below is the honest accounting, in two tiers.
+
+**Tier 1 — sketch-linked (Arduino library layer).** Measured with `size` (ESP32, `-Os`, text+data):
+
+| Dependency | Flash | Pulled in by | nff's *marginal* cost¹ |
+|---|--:|---|--:|
+| **PubSubClient** (MQTT client) | ~8.5 KB | `nff_mqtt` | **~8.5 KB** — nff-specific, rarely pre-present |
+| **NetworkClientSecure** + `ssl_client` (TLS glue) | ~9.5 KB | mqtt + ota | ~0 if app already does HTTPS |
+| **Update** + **HTTPClient** (OTA) | ~25.8 KB | `nff_ota` only | **~25.8 KB** — droppable with the OTA module |
+| **Preferences** (NVS wrapper) | ~4.0 KB | `nff_store` | ~0 if app already uses NVS |
+| **WiFi** (driver wrappers) | ~22.5 KB | app + nff | ~0 — your app already needs WiFi |
+| **Network** (TCP/IP client) | ~25.9 KB | everything networked | ~0 — shared with app |
+| **Tier-1 subtotal** | **~96 KB** | | **~9–35 KB** added by nff |
+
+**Tier 2 — precompiled in ESP-IDF / ROM (the real bulk of the ~1 MB).** These live in the
+toolchain's `.a` libraries and on-chip ROM, **not** in the sketch object tree, so they can't be
+itemized with `size` here — figures are typical ESP32 ranges, and most is **shared with WiFi so
+nff adds ~0**:
+
+| Stack | Approx. flash | nff's marginal cost on ESP32 |
+|---|--:|--:|
+| **mbedTLS** (TLS 1.2 + ECC/SHA, partly in ROM) | ~50–100 KB | ~0 — WiFi/TLS app already links it |
+| **lwIP** (TCP/IP stack) | ~40–60 KB | ~0 — shared |
+| **WiFi + BT driver + PHY blobs** (partly ROM) | ~150–250 KB | ~0 — your app's WiFi |
+| **FreeRTOS + newlib + IDF core** | remainder to ~1 MB | ~0 — base RTOS |
+
+¹ *Marginal cost* = what nff **adds** to a firmware that **already does WiFi + TLS** (the common
+case for a connected device). The headline: on ESP32, if the device already speaks TLS, **nff +
+its not-yet-present deps cost roughly `~23 KB (nff) + ~9 KB (PubSubClient + glue) ≈ 32 KB`, or
+`+ ~26 KB` more if you keep OTA.** On a *bare* image with no TLS/MQTT, you also inherit Tier 2 —
+which is why a non-TLS 300 KB firmware can't absorb nff in 50 KB.
+
+> ⚠️ Module exclusion is currently a **manual `CMakeLists.txt` edit** (drop the `src/nff_*.c`
+> entries and stub their hooks) — there is no `NFF_WITH_OTA`-style build flag yet. Only the
+> claim/bootstrap path has a real compile guard (`NFF_BOOTSTRAP_ENABLED`).
+
+For the full catalog of every way to shrink the build — proposed `NFF_WITH_*` feature flags,
+dependency/crypto trimming, RAM tuning, and toolchain flags — see
+**[NFF-SDK-OPTIMIZATION.md](NFF-SDK-OPTIMIZATION.md)**.
+
+---
+
 ## Requirements
 
 | Platform | Prerequisite |

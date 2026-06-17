@@ -86,6 +86,19 @@ static void on_status_cmd(const char *payload, char *resp, size_t resp_len, void
              (unsigned long)(esp_timer_get_time() / 1000));
 }
 
+// ---- Optional but recommended: OTA health check --------------------------
+//
+// After an OTA the new image runs on probation. The SDK already gates commit on
+// "broker reconnected + free heap above a floor + a soak window"; this callback
+// adds YOUR application's notion of healthy. Return false until the app is truly
+// working so a bad image is rolled back automatically. Must be non-blocking.
+static bool on_health_check(void *ctx) {
+    (void)ctx;
+    if (esp_get_free_heap_size() < 40000) return false;
+    // Add your own self-test here (sensor read, peripheral init, etc.).
+    return true;
+}
+
 // ---- Application task (Core 1) -------------------------------------------
 
 static void app_task(void *arg) {
@@ -111,6 +124,9 @@ void app_main(void) {
 
     // Register custom commands before connecting
     nff_register_command("status", on_status_cmd, NULL);
+
+    // Register the OTA health check before connecting — gates OTA commit/rollback.
+    nff_register_health_check(on_health_check, NULL);
 
     // Connect to nff broker (first attempt; nff task handles reconnects)
     nff_connect();

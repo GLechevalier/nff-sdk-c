@@ -20,6 +20,7 @@
 #include <Preferences.h>
 #include <Update.h>
 #include <HTTPClient.h>
+#include <esp_ota_ops.h>
 #include <freertos/FreeRTOS.h>
 #include <freertos/task.h>
 #include <freertos/semphr.h>
@@ -321,13 +322,30 @@ void nff_port_ota_abort(nff_ota_handle_t h) {
     s_ota_ctx.active = false;
 }
 
+int nff_port_ota_mark_valid(void) {
+    /* Best-effort: the stock Arduino bootloader is usually built without app
+       rollback, so this returns ESP_ERR_NOT_SUPPORTED — that's fine, the SDK's
+       software rollback does not depend on it. Report success either way. */
+    esp_ota_mark_app_valid_cancel_rollback();
+    return 0;
+}
+
+void nff_port_ota_rollback(void) {
+    /* Point the bootloader back at the previous (last-good) image and reboot.
+       During probation the inactive slot = the previous image. Independent of
+       the bootloader's rollback config. */
+    const esp_partition_t *prev = esp_ota_get_next_update_partition(NULL);
+    if (prev) esp_ota_set_boot_partition(prev);
+    ESP.restart();
+}
+
 void nff_port_reboot(void) { ESP.restart(); }
 
 /* ------------------------------------------------------------------ */
 /* HTTPS streaming                                                      */
 /* ------------------------------------------------------------------ */
 
-int nff_port_https_get_stream(const char *url,
+int nff_port_https_get_stream(const char *url, size_t resume_from,
                                int (*chunk_cb)(const uint8_t *, size_t, void *),
                                void *user_ctx, uint32_t timeout_ms) {
     WiFiClientSecure tls;
@@ -335,10 +353,21 @@ int nff_port_https_get_stream(const char *url,
     HTTPClient http;
     http.begin(tls, url);
     http.setTimeout((int)timeout_ms);
-    int http_code = http.GET();
-    if (http_code != 200) { http.end(); return -1; }
 
-    int        total  = http.getSize();        /* Content-Length, or -1 if unknown */
+    /* Resume from a previous partial download via an HTTP Range header. */
+    if (resume_from > 0) {
+        char range[40];
+        snprintf(range, sizeof(range), "bytes=%lu-", (unsigned long)resume_from);
+        http.addHeader("Range", range);
+    }
+
+    int http_code = http.GET();
+    /* A resume request must come back as 206 (partial). If the server ignored Range and sent
+       the whole body (200), we'd double-write the partition — tell the caller to restart clean. */
+    if (resume_from > 0 && http_code == 200) { http.end(); return NFF_ERR_RESUME_UNSUPPORTED; }
+    if (http_code != 200 && http_code != 206) { http.end(); return -1; }
+
+    int        total  = http.getSize();        /* Content-Length of this response, or -1 */
     WiFiClient *stream = http.getStreamPtr();
     uint8_t    buf[1024];
     int        rc = 0;
@@ -475,9 +504,59 @@ static void (*s_panic_hook)(const char *) = nullptr;
 
 void nff_port_install_panic_hook(void (*fn)(const char *)) {
     /* esp_set_panic_handler is not exposed in arduino-esp32 3.x;
-     * crash detection still works via esp_reset_reason() on next boot. */
+     * crash detection still works via esp_reset_reason() on next boot, and the fault
+     * detail (pc/backtrace) is recovered at boot from the coredump — see
+     * nff_port_get_crash_info below. */
     s_panic_hook = fn;
 }
+
+/* ------------------------------------------------------------------ */
+/* Crash fault detail — from the coredump-to-flash summary             */
+/* ------------------------------------------------------------------ */
+
+/* arduino-esp32's default build enables coredump-to-flash in ELF format with a 64 KB coredump
+ * partition, so esp_core_dump_get_summary() yields the fault PC + backtrace at boot with no
+ * partition/sdkconfig change — and it works here even though the panic hook above can't run. */
+#if defined(CONFIG_ESP_COREDUMP_ENABLE_TO_FLASH)
+#include <esp_core_dump.h>
+
+int nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out));
+    out->exception_cause = -1;
+
+    esp_core_dump_summary_t *s =
+        (esp_core_dump_summary_t *)malloc(sizeof(esp_core_dump_summary_t));
+    if (!s) return -1;
+
+    int rc = -1;
+    if (esp_core_dump_get_summary(s) == ESP_OK) {
+        out->pc = s->exc_pc;
+        snprintf(out->task_name, sizeof(out->task_name), "%s", s->exc_task);
+#if CONFIG_IDF_TARGET_ARCH_XTENSA
+        out->exception_cause = (int)s->ex_info.exc_cause;
+        out->fault_addr      = s->ex_info.exc_vaddr;
+#endif
+        uint32_t depth = s->exc_bt_info.depth;
+        if (depth > NFF_CRASH_BT_MAX) depth = NFF_CRASH_BT_MAX;
+        for (uint32_t i = 0; i < depth; i++) out->backtrace[i] = s->exc_bt_info.bt[i];
+        out->backtrace_len = (uint8_t)depth;
+        out->valid = true;
+        rc = 0;
+    }
+    free(s);
+    return rc;
+}
+
+void nff_port_crash_info_clear(void) { esp_core_dump_image_erase(); }
+
+#else  /* coredump disabled in this build */
+
+int  nff_port_get_crash_info(nff_crash_hw_info_t *out) {
+    memset(out, 0, sizeof(*out)); out->exception_cause = -1; return -1;
+}
+void nff_port_crash_info_clear(void) {}
+
+#endif
 
 /* ------------------------------------------------------------------ */
 /* AMP                                                                  */
