@@ -39,6 +39,33 @@
 uint32_t nff_port_millis(void) { return (uint32_t)millis(); }
 void     nff_port_delay_ms(uint32_t ms) { delay(ms); }
 
+/* mTLS verifies the broker's server-cert validity window (notBefore/notAfter)
+   against the wall clock. The ESP32 RTC boots at epoch 0 (1970), so a cert
+   minted in the present looks "not yet valid" -> MBEDTLS_X509_BADCERT_FUTURE ->
+   the connect fails forever with "X509 - Certificate verification failed".
+   Start SNTP and block (bounded) until the clock is sane before the first
+   secured connect. Idempotent: returns immediately once time is already set. */
+static bool s_time_synced = false;
+static void ensure_time_synced(void) {
+    if (s_time_synced) return;
+    /* UTC; cert dates are UTC. Multiple servers for resilience on flaky links. */
+    configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
+    /* Anything past 2021-01-01 means SNTP landed (vs the 1970 boot value). */
+    const time_t kSaneEpoch = 1609459200;
+    time_t now = 0;
+    for (int i = 0; i < 40; i++) {     /* up to ~10s, same order as the WiFi wait */
+        now = time(NULL);
+        if (now > kSaneEpoch) { s_time_synced = true; break; }
+        delay(250);
+    }
+    if (s_time_synced) {
+        nff_log("nff: time synced (epoch=%ld)", (long)now);
+    } else {
+        nff_log("nff: WARN time sync failed (epoch=%ld) — TLS may reject server cert",
+                (long)now);
+    }
+}
+
 /* ------------------------------------------------------------------ */
 /* Mutex                                                                */
 /* ------------------------------------------------------------------ */
@@ -201,7 +228,11 @@ int nff_port_mqtt_connect(nff_mqtt_handle_t *hh,
     if (lwt_topic)   strncpy(h->lwt_topic,   lwt_topic,  sizeof(h->lwt_topic)  - 1);
     if (lwt_payload) strncpy(h->lwt_payload, lwt_payload, sizeof(h->lwt_payload) - 1);
 
-    if (!h->tls_configured) h->tls.setInsecure(); /* dev only — no cert check */
+    if (!h->tls_configured) {
+        h->tls.setInsecure(); /* dev only — no cert check, so no clock needed */
+    } else {
+        ensure_time_synced(); /* real mTLS: cert date check needs a sane clock */
+    }
 
     bool ok = h->client.connect(h->client_id,
                                  "", "",  /* no username/password — mTLS is auth */
