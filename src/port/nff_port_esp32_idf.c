@@ -25,11 +25,10 @@
 #include "mbedtls/ecdsa.h"
 #include "mbedtls/ecp.h"
 #include "mbedtls/sha256.h"
+#include "mbedtls/base64.h"  /* DER->PEM so a leaf+intermediate chain can be presented */
 #include <string.h>
 #include <stdlib.h>
 #include <stdio.h>
-
-static const char *TAG = "nff_port";
 
 /* ------------------------------------------------------------------ */
 /* Time                                                                 */
@@ -86,6 +85,11 @@ struct nff_mqtt_handle {
     const uint8_t           *ca;    size_t ca_len;
     const uint8_t           *cert;  size_t cert_len;
     const uint8_t           *key;   size_t key_len;
+    const uint8_t           *inter; size_t inter_len;  /* project intermediate CA (optional) */
+    /* PEM forms built at connect (esp-mqtt wants PEM to send a multi-cert client chain). */
+    char                    *ca_pem;
+    char                    *cert_pem;  /* leaf, or leaf||intermediate chain */
+    char                    *key_pem;
     char                     host[256];
     uint16_t                 port;
     char                     lwt_topic[128];
@@ -135,14 +139,48 @@ void nff_port_mqtt_set_server(nff_mqtt_handle_t *h,
     mh->port = port;
 }
 
+/* Convert DER bytes to a null-terminated PEM string (heap-allocated, 64-col).
+ * Mirrors the Arduino port's helper so both ports present an identical chain. */
+static char *der_to_pem(const char *header, const char *footer,
+                        const uint8_t *der, size_t der_len) {
+    if (!der || !der_len) return NULL;
+    size_t b64_len = 0;
+    mbedtls_base64_encode(NULL, 0, &b64_len, der, der_len);
+
+    uint8_t *b64 = (uint8_t *)malloc(b64_len + 1);
+    if (!b64) return NULL;
+    size_t actual = 0;
+    if (mbedtls_base64_encode(b64, b64_len + 1, &actual, der, der_len) != 0) {
+        free(b64);
+        return NULL;
+    }
+
+    size_t hdr = strlen(header), ftr = strlen(footer);
+    size_t lines = (actual + 63) / 64;
+    char *pem = (char *)malloc(hdr + 1 + actual + lines + ftr + 2);
+    if (!pem) { free(b64); return NULL; }
+
+    char *p = pem;
+    memcpy(p, header, hdr); p += hdr; *p++ = '\n';
+    for (size_t pos = 0; pos < actual; ) {
+        size_t n = (actual - pos > 64) ? 64 : (actual - pos);
+        memcpy(p, b64 + pos, n); p += n; *p++ = '\n'; pos += n;
+    }
+    memcpy(p, footer, ftr); p += ftr; *p++ = '\n'; *p = '\0';
+    free(b64);
+    return pem;
+}
+
 void nff_port_mqtt_set_tls(nff_mqtt_handle_t *h,
                             const uint8_t *ca, size_t ca_len,
                             const uint8_t *cert, size_t cert_len,
-                            const uint8_t *key, size_t key_len) {
+                            const uint8_t *key, size_t key_len,
+                            const uint8_t *inter, size_t inter_len) {
     struct nff_mqtt_handle *mh = (struct nff_mqtt_handle *)h;
-    mh->ca       = ca;   mh->ca_len   = ca_len;
-    mh->cert     = cert; mh->cert_len = cert_len;
-    mh->key      = key;  mh->key_len  = key_len;
+    mh->ca       = ca;    mh->ca_len    = ca_len;
+    mh->cert     = cert;  mh->cert_len  = cert_len;
+    mh->key      = key;   mh->key_len   = key_len;
+    mh->inter    = inter; mh->inter_len = inter_len;
 }
 
 void nff_port_mqtt_set_rx_callback(nff_mqtt_handle_t *h,
@@ -171,19 +209,54 @@ int nff_port_mqtt_connect(nff_mqtt_handle_t *h,
     char uri[320];
     snprintf(uri, sizeof(uri), "mqtts://%s:%u", mh->host, (unsigned)mh->port);
 
+    /* Build PEM buffers from the DER inputs. esp-mqtt's authentication.certificate accepts a
+     * concatenated leaf||intermediate PEM and sends both in the TLS Certificate message, so a
+     * broker that only trusts the root can build leaf -> intermediate -> root. Leaf-only
+     * (inter == NULL) preserves single-cert behaviour. Rebuilt each connect; freed here first so
+     * a reconnect does not leak. */
+    free(mh->ca_pem);   mh->ca_pem   = NULL;
+    free(mh->cert_pem); mh->cert_pem = NULL;
+    free(mh->key_pem);  mh->key_pem  = NULL;
+    mh->ca_pem  = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
+                             mh->ca, mh->ca_len);
+    mh->key_pem = der_to_pem("-----BEGIN PRIVATE KEY-----", "-----END PRIVATE KEY-----",
+                             mh->key, mh->key_len);
+    mh->cert_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
+                              mh->cert, mh->cert_len);
+    if (mh->cert_pem && mh->inter && mh->inter_len) {
+        char *inter_pem = der_to_pem("-----BEGIN CERTIFICATE-----", "-----END CERTIFICATE-----",
+                                     mh->inter, mh->inter_len);
+        if (inter_pem) {
+            char *chain = (char *)malloc(strlen(mh->cert_pem) + strlen(inter_pem) + 1);
+            if (chain) {
+                strcpy(chain, mh->cert_pem);   /* der_to_pem terminates the leaf with '\n' */
+                strcat(chain, inter_pem);
+                free(mh->cert_pem);
+                mh->cert_pem = chain;
+            }
+            free(inter_pem);
+        }
+    }
+
     const esp_mqtt_client_config_t cfg = {
         .broker = {
             .address.uri = uri,
-            .verification.certificate     = (const char *)mh->ca,
-            .verification.certificate_len = mh->ca_len,
+            .verification.certificate     = mh->ca_pem,
+            .verification.certificate_len = mh->ca_pem ? strlen(mh->ca_pem) + 1 : 0,
+#ifdef NFF_QEMU
+            /* L2/QEMU only: the fleet server cert's SAN omits the dialed guest IP, so the
+             * hostname check would reject it. Mirrors the Python mock's tls_insecure_hostname.
+             * NEVER set on real hardware — CN/SAN verification must stay on in production. */
+            .verification.skip_cert_common_name_check = true,
+#endif
         },
         .credentials = {
             .client_id         = client_id,
             .authentication = {
-                .certificate     = (const char *)mh->cert,
-                .certificate_len = mh->cert_len,
-                .key             = (const char *)mh->key,
-                .key_len         = mh->key_len,
+                .certificate     = mh->cert_pem,
+                .certificate_len = mh->cert_pem ? strlen(mh->cert_pem) + 1 : 0,
+                .key             = mh->key_pem,
+                .key_len         = mh->key_pem ? strlen(mh->key_pem) + 1 : 0,
             },
         },
         .session = {
@@ -500,22 +573,15 @@ void nff_port_get_unique_id(char *out, size_t out_len) {
 
 #include "esp_system.h"
 
-static void (*s_panic_hook)(const char *) = NULL;
-
-static void IRAM_ATTR nff_esp_panic_handler(const esp_panic_info_t *info) {
-    if (s_panic_hook) {
-        char reason[64];
-        snprintf(reason, sizeof(reason), "cause=%d pc=0x%08x",
-                 (int)info->exception_cause,
-                 (uint32_t)(uintptr_t)info->exception_addr);
-        s_panic_hook(reason);
-    }
-    esp_default_panic_handler(info);
-}
-
+/* Synchronous panic-reason capture relied on non-public IDF APIs (esp_set_panic_handler /
+ * esp_panic_info_t / esp_default_panic_handler) that do not exist on IDF 5.x. On ESP-IDF the
+ * real crash-detail path is the coredump-to-flash summary read at the NEXT boot
+ * (nff_port_get_crash_info -> esp_core_dump_get_summary, below), which yields the fault PC +
+ * a resolvable backtrace without any panic-context work. So the hook is a documented no-op
+ * here; nff_crash.c uses the coredump summary and degrades gracefully when the hook never fires.
+ * (If a synchronous reason is ever required, override via the linker `--wrap esp_panic_handler`.) */
 void nff_port_install_panic_hook(void (*fn)(const char *)) {
-    s_panic_hook = fn;
-    esp_set_panic_handler(nff_esp_panic_handler);
+    (void)fn;
 }
 
 /* ------------------------------------------------------------------ */

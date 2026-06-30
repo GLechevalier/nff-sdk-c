@@ -23,6 +23,96 @@ void loop() {
 
 ---
 
+## Quickstart
+
+From zero to a device reporting into your fleet, on Arduino/ESP32, in five steps.
+(ESP-IDF differs only in install + entry point — see [Usage](#usage).)
+
+### 0. Prerequisites
+
+- An ESP32 board and the [Arduino ESP32 core](https://github.com/espressif/arduino-esp32) installed.
+- The [PubSubClient](https://github.com/knolleary/pubsubclient) library (Arduino Library Manager).
+- The `nff` CLI on your PATH (`pip install nff`) and a logged-in fleet (`nff auth status`).
+- A reachable nff broker hostname (e.g. `nff.yourdomain.com`, TLS port `8883`).
+
+### 1. Install the SDK as an Arduino library
+
+This repo is the source of truth, but the Arduino IDE needs a flat layout — generate it
+(don't hand-copy):
+
+```bash
+python tools/sync_arduino_lib.py     # writes <sketchbook>/libraries/nff
+pwsh   tools/install-hooks.ps1        # optional: auto-resync on every commit/merge
+```
+
+### 2. Provision the device
+
+This mints the per-device mTLS identity and writes `credentials.h`:
+
+```bash
+nff provision new-device --id my-device-01
+```
+
+> **Never commit `credentials.h`** — it holds the device private key. Add it to `.gitignore`.
+
+### 3. Write the sketch
+
+Copy `examples/arduino_basic/arduino_basic.ino` (and your `credentials.h`) into a sketch
+folder, then set four values at the top:
+
+```c
+#include <WiFi.h>
+#include <nff.h>
+#include "credentials.h"
+
+#define WIFI_SSID       "YourWiFiSSID"
+#define WIFI_PASS       "YourWiFiPassword"
+#define DEVICE_ID       "my-device-01"        // must match the --id you provisioned
+#define NFF_BROKER_HOST "nff.yourdomain.com"
+
+NFF_CONFIG(g_cfg, DEVICE_ID, NFF_BROKER_HOST);
+
+void setup() {
+    Serial.begin(115200);
+    WiFi.begin(WIFI_SSID, WIFI_PASS);
+    while (WiFi.status() != WL_CONNECTED) delay(500);
+
+    nff_init(&g_cfg);     // installs panic hook, checks last-boot crash/OTA result
+    nff_connect();        // mTLS handshake → retained heartbeat → subscribe to cmd topic
+}
+
+void loop() {
+    nff_loop();           // non-blocking: keepalive, reconnect, heartbeat, commands
+    // ... your application code ...
+}
+```
+
+### 4. Flash and watch
+
+```bash
+nff flash path/to/your/sketch        # compiles with fw/build identity injected, then flashes
+```
+
+The serial log should show WiFi up → mTLS connect → `heartbeat` published. The device now
+appears **online** in the dashboard within one heartbeat interval (default 30 s).
+
+### 5. Talk to it
+
+From the dashboard or CLI, send the built-in `ping` / `diag` commands, push an `ota` update,
+or register your own command (see [Custom commands](#custom-commands)). Every command is
+ECDSA-signed by the server and verified on-device before it runs.
+
+> **One gotcha to remember:** the MQTT RX buffer (`NFF_MQTT_BUFFER_SIZE`, default 1024 B) must
+> exceed your largest command. An `ota` command carrying a pre-signed URL is ~400–600 B;
+> PubSubClient's *own* 256 B default would silently drop it, which is why the SDK raises it.
+> If you use very long signed URLs, bump it to `2048`.
+
+**Want the full picture of what happens on the wire?** See
+**[docs/PROTOCOL.md](docs/PROTOCOL.md)** — heartbeat, the OTA state machine, every tunable, and
+the complete device↔platform message sequences.
+
+---
+
 ## What it does
 
 The SDK maintains a second MQTT connection to the nff broker running alongside your existing application. The connection is device-initiated (no port forwarding needed) and runs at low priority — in steady state it adds ~4 bytes/minute of bandwidth overhead.
@@ -273,12 +363,17 @@ void sensor_task(void) {
 
 ## MQTT topics
 
+Topics are namespaced by tenant (`project_id`, a UUID from `credentials.h`) and device id:
+
 ```
-nff/devices/{id}/cmd          ← nff server → device (commands)
-nff/devices/{id}/response     ← device → nff server (replies)
-nff/devices/{id}/heartbeat    ← device → broker (retained presence)
-nff/devices/{id}/crash        ← device → broker (retained crash report)
+nff/{project_id}/devices/{id}/cmd          ← nff server → device (signed commands)
+nff/{project_id}/devices/{id}/response     ← device → nff server (replies, OTA results)
+nff/{project_id}/devices/{id}/heartbeat    ← device → broker (retained presence + LWT)
+nff/{project_id}/devices/{id}/crash        ← device → broker (retained crash report)
 ```
+
+For the full message flow on each topic — heartbeat, commands, and the OTA state machine — see
+**[docs/PROTOCOL.md](docs/PROTOCOL.md)**.
 
 ---
 

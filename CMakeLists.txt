@@ -33,12 +33,19 @@ if(DEFINED IDF_TARGET)
             esp_timer
             freertos
             nvs_flash
-            esp-mqtt
+            mqtt            # IDF 5.x renamed the "esp-mqtt" component to "mqtt"
             esp_wifi
             esp_http_client
             esp_https_ota
+            app_update      # esp_ota_ops.h (OTA partition flip / rollback)
+            espcoredump     # esp_core_dump.h (coredump-to-flash crash summary)
             mbedtls
     )
+
+    # uint32_t's underlying type (unsigned int vs long unsigned int) varies by toolchain, so the
+    # SDK's %u/%lu printf specifiers warn under IDF's -Werror. Suppress format warnings for THIS
+    # component only (not a global -w): the eventual cleanup is a PRIxNN/<inttypes.h> sweep over src/.
+    target_compile_options(${COMPONENT_LIB} PRIVATE -Wno-format)
 
 else()
     # ---- Host / POSIX build (unit tests) -------------------------------------
