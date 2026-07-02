@@ -111,10 +111,24 @@ void nff_crash_init(void) {
 static int was_crash_boot(void) {
 #if defined(ESP_PLATFORM)
     esp_reset_reason_t r = esp_reset_reason();
-    return (r == ESP_RST_PANIC     ||
-            r == ESP_RST_INT_WDT   ||
-            r == ESP_RST_TASK_WDT  ||
-            r == ESP_RST_WDT);
+    if (r == ESP_RST_PANIC     ||
+        r == ESP_RST_INT_WDT   ||
+        r == ESP_RST_TASK_WDT  ||
+        r == ESP_RST_WDT)
+        return 1;
+    /* Fall back to a stored coredump image. Under qemu-system-xtensa the L2 supervisor runs QEMU
+       with -no-reboot and relaunches a FRESH qemu process on every panic, so the guest always
+       boots as ESP_RST_POWERON and the panic reset-reason is lost — but the coredump written to
+       the flash partition persists across the relaunch (verified: "Found core dump ... in flash").
+       A valid coredump present == an unreported crash. Harmless on real hardware (a coredump only
+       exists after a real crash), and nff_crash_check_and_report erases it after reporting
+       (nff_port_crash_info_clear -> esp_core_dump_image_erase) so a clean boot won't re-report. */
+    {
+        nff_crash_hw_info_t hw;
+        if (nff_port_get_crash_info(&hw) == 0 && hw.valid)
+            return 1;
+    }
+    return 0;
 #else
     char val[4] = {0};
     return (nff_port_nvs_get_str("crash_simulate", val, sizeof(val)) == 0

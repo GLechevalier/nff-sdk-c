@@ -106,6 +106,13 @@ typedef struct {
      * (NULL when unused). In bootstrap mode, cmd_verify_key holds the fleet ROLLOVER-verify key. */
     const char    *batch_id;                              /* NULL unless bootstrapping */
     const uint8_t *intermediate_cert;  size_t intermediate_cert_len;
+
+    /* Optional device-type override for the heartbeat/announce. NULL/"" → the port reports the
+     * real silicon type (nff_port_get_hw_info). Set only by virtual/emulated builds that must
+     * advertise a distinct type (e.g. the L2 QEMU mock reports "nff-qemu-esp32" so the OTA plane
+     * routes it to the real-compile path). A device can still not lie about being real hardware —
+     * this is a build-baked value on images that are deliberately not real silicon. */
+    const char    *device_type;                           /* NULL → use hw.device_type */
 } nff_config_t;
 
 /* ------------------------------------------------------------------ */
@@ -171,7 +178,8 @@ typedef struct {
         NFF_FQBN,                                               \
         30,                                                     \
         NULL,                                                   \
-        NFF_INTERMEDIATE_CERT_DER, NFF_INTERMEDIATE_CERT_LEN    \
+        NFF_INTERMEDIATE_CERT_DER, NFF_INTERMEDIATE_CERT_LEN,   \
+        NULL   /* device_type: NULL → port reports real silicon */ \
     }
 
 /* ESP-IDF / C99 designated initializer */
@@ -195,6 +203,7 @@ typedef struct {
     .batch_id             = NULL,                               \
     .intermediate_cert    = NFF_INTERMEDIATE_CERT_DER,          \
     .intermediate_cert_len = NFF_INTERMEDIATE_CERT_LEN,         \
+    .device_type          = NULL,                               \
 }
 
 /* Bootstrap config: the device boots on the SHARED batch credential and pins the fleet ROLLOVER

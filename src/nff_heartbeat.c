@@ -31,6 +31,10 @@ static void publish_heartbeat(void) {
     uint32_t hb_s = g_nff.cfg->heartbeat_interval_s
                     ? g_nff.cfg->heartbeat_interval_s
                     : NFF_HEARTBEAT_INTERVAL_S;
+    /* A config device_type overrides the silicon probe (virtual/emulated builds like the L2 QEMU
+     * mock advertise "nff-qemu-esp32"); NULL/empty falls back to the real hardware type. */
+    const char *device_type = (g_nff.cfg->device_type && g_nff.cfg->device_type[0])
+                              ? g_nff.cfg->device_type : hw.device_type;
     char payload[416];
     snprintf(payload, sizeof(payload),
              "{\"status\":\"online\","
@@ -48,7 +52,7 @@ static void publish_heartbeat(void) {
              g_nff.cfg->device_id,
              g_nff.cfg->fw_version  ? g_nff.cfg->fw_version  : "",
              g_nff.cfg->build_id    ? g_nff.cfg->build_id    : "",
-             hw.device_type,
+             device_type,
              g_nff.cfg->fqbn        ? g_nff.cfg->fqbn        : "",
              hw.chip_model,
              (unsigned)hw.revision,

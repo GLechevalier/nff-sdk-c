@@ -107,11 +107,14 @@ err:
 void nff_claim_announce(void) {
     nff_hw_info_t hw;
     nff_port_get_hw_info(&hw);
+    /* Config device_type overrides the silicon probe (virtual builds); NULL/empty → hardware type. */
+    const char *device_type = (g_nff.cfg->device_type && g_nff.cfg->device_type[0])
+                              ? g_nff.cfg->device_type : hw.device_type;
     char json[256];
     snprintf(json, sizeof(json),
              "{\"status\":\"unclaimed\",\"id\":\"%s\",\"device_type\":\"%s\",\"chip\":\"%s\","
              "\"flash\":%u,\"fw\":\"%s\"}",
-             g_nff.cfg->device_id, hw.device_type, hw.chip_model,
+             g_nff.cfg->device_id, device_type, hw.chip_model,
              (unsigned)hw.flash_size, g_nff.cfg->fw_version ? g_nff.cfg->fw_version : "");
     char topic[NFF_TOPIC_MAXLEN];
     nff_topic_bootstrap_announce(&g_nff, topic);
