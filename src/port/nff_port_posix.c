@@ -566,6 +566,16 @@ void nff_port_posix_clear_published(nff_mqtt_handle_t *h) {
     h->pub_head = 0;
 }
 
+/**
+ * Simulate a WiFi/MQTT drop: mark the mock socket disconnected. The next nff_mqtt_tick sees
+ * !is_connected(), reconnects (nff_port_mqtt_connect always re-connects the mock), and re-runs
+ * the post-connect setup. Test-only.
+ */
+void nff_port_posix_force_disconnect(nff_mqtt_handle_t *h) {
+    if (!h) return;
+    h->connected = false;
+}
+
 /** Reset in-memory NVS (call between test cases). */
 void nff_port_posix_reset_nvs(void) {
     memset(s_nvs, 0, sizeof(s_nvs));

@@ -23,6 +23,7 @@ extern void nff_security_reset_nonce_ring(void);
 void        nff_port_posix_inject_mqtt(nff_mqtt_handle_t *h, const char *topic, const char *payload);
 const char *nff_port_posix_get_published(nff_mqtt_handle_t *h, const char *topic);
 void        nff_port_posix_clear_published(nff_mqtt_handle_t *h);
+void        nff_port_posix_force_disconnect(nff_mqtt_handle_t *h);
 void        nff_port_posix_reset_nvs(void);
 int         nff_port_posix_reboot_called(void);
 void        nff_port_posix_reset_reboot(void);
@@ -156,11 +157,58 @@ static void test_rollover_dispatch(void) {
     printf("PASS: rollover_cert dispatch → persist + ack + reboot\n");
 }
 
+/* ------------------------------------------------------------------ reconnect re-announce */
+
+/* Regression: a WiFi/MQTT drop while UNCLAIMED must reconnect, re-subscribe to the bootstrap
+ * cmd topic, and RE-ANNOUNCE — not silently fall back to the claimed cmd/heartbeat path (which
+ * is ACL-denied for a device that holds only the shared batch credential). */
+static void test_bootstrap_reconnect_reannounce(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_reboot();
+
+    static nff_config_t cfg = {0};
+    cfg.device_id = "";
+    cfg.project_id = "test-project";
+    cfg.broker_host = "localhost";
+    cfg.broker_port = 8883;
+    cfg.client_cert = MOCK_VKEY; cfg.client_cert_len = 1;
+    cfg.client_key  = MOCK_VKEY; cfg.client_key_len  = 1;
+    cfg.ca_cert     = MOCK_VKEY; cfg.ca_cert_len     = 1;
+    cfg.cmd_verify_key = MOCK_VKEY; cfg.cmd_verify_key_len = 65;
+    cfg.batch_id = "batch-test";
+
+    nff_init(&cfg);
+    assert(nff_get_mode() == NFF_MODE_BOOTSTRAP);
+    nff_connect();
+
+    /* Initial announce landed on the bootstrap topic. */
+    const char *ann = nff_port_posix_get_published(g_nff.mqtt,
+        "nff/_bootstrap/batch-test/deadbeef0001/announce");
+    assert(ann != NULL && strstr(ann, "unclaimed") != NULL);
+
+    /* Simulate a WiFi blip, then one tick: the mock reconnects on the next connect. */
+    nff_port_posix_clear_published(g_nff.mqtt);
+    nff_port_posix_force_disconnect(g_nff.mqtt);
+    nff_mqtt_tick();
+
+    /* Fixed: reconnect RE-ANNOUNCED on the bootstrap topic ... */
+    const char *reann = nff_port_posix_get_published(g_nff.mqtt,
+        "nff/_bootstrap/batch-test/deadbeef0001/announce");
+    assert(reann != NULL && strstr(reann, "unclaimed") != NULL);
+
+    /* ... and did NOT publish to the claimed heartbeat topic (the old bug). */
+    const char *hb = nff_port_posix_get_published(g_nff.mqtt,
+        "nff/test-project/devices/deadbeef0001/heartbeat");
+    assert(hb == NULL);
+    printf("PASS: bootstrap reconnect re-announces (not claimed cmd/heartbeat)\n");
+}
+
 int main(void) {
     test_base64();
     test_store_roundtrip();
     test_mode_selection();
     test_rollover_dispatch();
+    test_bootstrap_reconnect_reannounce();
     printf("All claim rollover tests passed.\n");
     return 0;
 }
