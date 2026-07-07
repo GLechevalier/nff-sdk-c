@@ -39,31 +39,55 @@
 uint32_t nff_port_millis(void) { return (uint32_t)millis(); }
 void     nff_port_delay_ms(uint32_t ms) { delay(ms); }
 
-/* mTLS verifies the broker's server-cert validity window (notBefore/notAfter)
-   against the wall clock. The ESP32 RTC boots at epoch 0 (1970), so a cert
-   minted in the present looks "not yet valid" -> MBEDTLS_X509_BADCERT_FUTURE ->
-   the connect fails forever with "X509 - Certificate verification failed".
-   Start SNTP and block (bounded) until the clock is sane before the first
-   secured connect. Idempotent: returns immediately once time is already set. */
-static bool s_time_synced = false;
-static void ensure_time_synced(void) {
-    if (s_time_synced) return;
-    /* UTC; cert dates are UTC. Multiple servers for resilience on flaky links. */
-    configTime(0, 0, "pool.ntp.org", "time.nist.gov", "time.google.com");
-    /* Anything past 2021-01-01 means SNTP landed (vs the 1970 boot value). */
+/* mTLS verifies the broker's server-cert validity window (notBefore/notAfter) against the wall
+   clock. The ESP32 RTC boots at epoch 0 (1970), so a present-day cert looks "not yet valid" ->
+   MBEDTLS_X509_BADCERT_FUTURE -> the handshake fails with "X509 - Certificate verification failed".
+   SNTP is UDP and can take many seconds to land (the first request right after WiFi association is
+   easily missed), so this must be robust to a flaky link:
+     - start the SNTP client ONCE and let it run in the background. Re-issuing configTime() on every
+       reconnect (the old bug) restarts the SNTP state machine and discards the in-flight response,
+       so on a lossy network the clock could NEVER converge and the device never came online;
+     - poll for a sane clock with a generous budget;
+     - the CALLER must not attempt the mTLS connect until this returns true (a connect with a 1970
+       clock is guaranteed to fail).
+   Returns true once the clock is sane. Idempotent after that. */
+static bool s_time_synced  = false;
+static bool s_sntp_started = false;
+
+static bool ensure_time_synced(void) {
+    if (s_time_synced) return true;
+
+    /* Anything past 2021-01-01 means the clock is real (vs the 1970 boot value). Take an
+       already-sane RTC (e.g. preserved across a soft reset) without waiting on SNTP. */
     const time_t kSaneEpoch = 1609459200;
+    if (time(NULL) > kSaneEpoch) { s_time_synced = true; return true; }
+
+    /* Start the background SNTP client exactly once. UTC (cert dates are UTC); multiple
+       well-connected servers for resilience. Do NOT restart it on later calls. */
+    if (!s_sntp_started) {
+        configTime(0, 0, "pool.ntp.org", "time.google.com", "time.cloudflare.com");
+        s_sntp_started = true;
+    }
+
+    /* Poll for the background client to land a response. The first wait after boot is generous
+       (SNTP is often slow right after association); later calls poll briefly, since the client is
+       already running and may have synced between attempts. */
+    static bool s_first_wait = true;
+    const int attempts = s_first_wait ? 80 : 20;   /* ~20s first, ~5s on each reconnect */
+    s_first_wait = false;
     time_t now = 0;
-    for (int i = 0; i < 40; i++) {     /* up to ~10s, same order as the WiFi wait */
+    for (int i = 0; i < attempts; i++) {
         now = time(NULL);
         if (now > kSaneEpoch) { s_time_synced = true; break; }
         delay(250);
     }
+
     if (s_time_synced) {
         nff_log("nff: time synced (epoch=%ld)", (long)now);
     } else {
-        nff_log("nff: WARN time sync failed (epoch=%ld) — TLS may reject server cert",
-                (long)now);
+        nff_log("nff: time not synced yet (epoch=%ld) — deferring mTLS until NTP lands", (long)now);
     }
+    return s_time_synced;
 }
 
 /* ------------------------------------------------------------------ */
@@ -230,8 +254,11 @@ int nff_port_mqtt_connect(nff_mqtt_handle_t *hh,
 
     if (!h->tls_configured) {
         h->tls.setInsecure(); /* dev only — no cert check, so no clock needed */
-    } else {
-        ensure_time_synced(); /* real mTLS: cert date check needs a sane clock */
+    } else if (!ensure_time_synced()) {
+        /* Real mTLS needs a sane clock or the broker's server cert reads as not-yet-valid. Skip
+           this attempt rather than burn a doomed handshake; the reconnect loop retries and the
+           background SNTP client keeps running until it lands. */
+        return -1;
     }
 
     bool ok = h->client.connect(h->client_id,
