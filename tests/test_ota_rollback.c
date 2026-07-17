@@ -331,6 +331,54 @@ static void test_trial_heap_floor_veto(void) {
     printf("PASS: low heap vetoes commit, then rolls back at deadline\n");
 }
 
+/* Commit records the adopted version under "fw_adopted" so the L2 config loader
+   (nvs_creds.c) can report the RUNNING image's real version in telemetry instead of the
+   build-time-baked default — without which migration 0080's semver recovery check can
+   never observe a fix on an L2/QEMU device. */
+static void test_commit_records_fw_adopted(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "2.4.0");
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();
+    elapse_soak();
+    nff_loop();                /* soak elapsed -> commit */
+    assert(g_nff.ota_trial == false);
+    assert(nff_port_posix_ota_mark_valid_called() == 1);
+
+    char fw[32] = {0};
+    assert(nff_port_nvs_get_str("fw_adopted", fw, sizeof(fw)) == 0);
+    assert(strcmp(fw, "2.4.0") == 0);
+    printf("PASS: commit records adopted fw version to NVS\n");
+}
+
+/* Rollback must NOT clobber a previously-committed fw_adopted: it still names the image
+   being reverted to. fw_adopted is written only on commit, so during a failing trial it
+   holds the OLD committed version — which is exactly the image rollback restores. */
+static void test_rollback_preserves_fw_adopted(void) {
+    nff_port_posix_reset_nvs();
+    nff_port_posix_reset_ota_flags();
+    nff_port_nvs_set_str("fw_adopted",     "2.1.0");   /* the currently-committed image */
+    nff_port_nvs_set_str("ota_trial",      "1");
+    nff_port_nvs_set_str("ota_version",    "3.0.0");   /* the failing trial */
+    nff_port_nvs_set_u32("ota_boot_count", 0);
+    nff_port_nvs_commit();
+
+    do_init();
+    nff_register_health_check(health_always_false, NULL);
+    g_nff.ota_trial_deadline_ms = nff_port_millis() - 1;  /* window already elapsed */
+    nff_loop();                /* not healthy + past deadline -> rollback */
+    assert(nff_port_posix_ota_rollback_called() == 1);
+
+    char fw[32] = {0};
+    assert(nff_port_nvs_get_str("fw_adopted", fw, sizeof(fw)) == 0);
+    assert(strcmp(fw, "2.1.0") == 0);   /* untouched — still names the reverted image */
+    printf("PASS: rollback preserves prior adopted fw version\n");
+}
+
 int main(void) {
     test_pending_committed();
     test_pending_rolled_back();
@@ -341,6 +389,8 @@ int main(void) {
     test_trial_rollback_on_bootloop();
     test_trial_health_veto_holds();
     test_trial_heap_floor_veto();
+    test_commit_records_fw_adopted();
+    test_rollback_preserves_fw_adopted();
 
     printf("All OTA rollback tests passed.\n");
     return 0;

@@ -115,6 +115,14 @@ static void nff_ota_commit(void) {
     nff_topic_response(&g_nff, topic);
     nff_port_mqtt_publish(g_nff.mqtt, topic, payload, 1, false);
 
+    /* Record the version of the image we just committed so the next config load
+       (nvs_creds.c) reports the RUNNING image's version in telemetry, not the
+       build-time-baked NFF_FW_VERSION of this generic L2 image. Written only on
+       commit, so it always names the currently-booted, confirmed image — which is
+       also the image a later rollback reverts to, so rollback must NOT clear it.
+       Flushed by ota_clear_trial_nvs() below (which commits). */
+    nff_port_nvs_set_str("fw_adopted", g_nff.pending_ota_version);
+
     ota_clear_trial_nvs();
     g_nff.ota_trial = false;
     nff_log("nff: OTA committed v%s", g_nff.pending_ota_version);
