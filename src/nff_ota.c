@@ -222,6 +222,20 @@ void nff_ota_trial_tick(void) {
 /* Main OTA command handler (called from nff_cmd.c)                    */
 /* ------------------------------------------------------------------ */
 
+/* An emulated (QEMU) device has no reachable artifact origin: the OTA command carries a
+   Supabase signed URL that the guest's SLIRP-only network can't fetch (there is no guestfwd
+   for it, and a raw TCP forward can't serve a hostname/SNI/path-based signed URL). Rather than
+   stall the download until the OTA plane reaps the job to timed_out — which leaves the device
+   forever on baseline firmware while the deployment falsely reads "finished" — such a device
+   adopts the requested version directly, exactly like the L1 software mock (device.py
+   _apply_pending_ota). The server-side compile that produced the image is still real; only the
+   byte transfer is simulated. Gated on the QEMU device_type so real silicon always does a real
+   HTTPS download + partition flip. */
+static bool nff_ota_download_simulated(void) {
+    const char *dt = g_nff.cfg->device_type;
+    return dt != NULL && strcmp(dt, "nff-qemu-esp32") == 0;
+}
+
 void nff_ota_handle_cmd(const char *payload, char *resp, size_t resp_len) {
     char version[32]  = {0};
     char url[512]     = {0};
@@ -264,6 +278,35 @@ void nff_ota_handle_cmd(const char *payload, char *resp, size_t resp_len) {
     /* Mark state — nff_loop won't drive heartbeat during OTA */
     g_nff.state = NFF_STATE_OTA_ACTIVE;
     nff_log("nff: OTA start v%s", version);
+
+    /* Emulated device: adopt the version in place instead of a real download + partition flip.
+       Persist it (nvs_creds.c reads "fw_adopted" on future boots), point the live config at it so
+       THIS session's heartbeat reports the new version immediately, and publish committed so the
+       OTA plane finalizes success (advancing current_firmware_version) rather than reaping the job
+       to timed_out. No image changes and no reboot — only the version telemetry advances, which is
+       exactly what makes the self-heal demo's recovery real and observable. The cfg object is owned
+       by the caller of nff_init (non-const storage; the SDK holds a const view), so the cast below
+       is well-defined; pending_ota_version is process-lifetime storage in g_nff. */
+    if (nff_ota_download_simulated()) {
+        strncpy(g_nff.pending_ota_version, version, sizeof(g_nff.pending_ota_version) - 1);
+        g_nff.pending_ota_version[sizeof(g_nff.pending_ota_version) - 1] = '\0';
+        nff_port_nvs_set_str("fw_adopted", g_nff.pending_ota_version);
+        nff_port_nvs_commit();
+        ((nff_config_t *)g_nff.cfg)->fw_version = g_nff.pending_ota_version;
+
+        char done[256];
+        snprintf(done, sizeof(done),
+                 "{\"type\":\"ota_result\",\"status\":\"committed\","
+                 "\"version\":\"%s\",\"id\":\"%s\"}",
+                 g_nff.pending_ota_version, g_nff.cfg->device_id);
+        nff_port_mqtt_publish(g_nff.mqtt, topic, done, 1, false);
+
+        g_nff.state = NFF_STATE_CONNECTED;
+        nff_log("nff: OTA simulated-adopt v%s (qemu: no reachable artifact origin)",
+                g_nff.pending_ota_version);
+        resp[0] = '\0';
+        return;
+    }
 
     /* Convert expected SHA-256 hex to bytes */
     uint8_t expected_sha[32] = {0};

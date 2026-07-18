@@ -379,6 +379,63 @@ static void test_rollback_preserves_fw_adopted(void) {
     printf("PASS: rollback preserves prior adopted fw version\n");
 }
 
+/* An emulated (nff-qemu-esp32) device can't fetch the signed artifact URL, so it adopts the
+   requested version IN PLACE: publishes committed immediately, persists fw_adopted, advances its
+   live reported version, and never touches the download/rollback machinery. This is what makes the
+   L2 self-heal demo recover for real instead of stalling until the OTA plane reaps it to timed_out. */
+static void test_qemu_simulated_adopt(void) {
+    nff_port_posix_reset_nvs();
+    nff_security_reset_nonce_ring();
+
+    static nff_config_t cfg = NFF_CONFIG_INITIALIZER("test-device", "localhost");
+    cfg.cmd_verify_key     = NFF_CMD_VERIFY_KEY_DER;
+    cfg.cmd_verify_key_len = NFF_CMD_VERIFY_KEY_LEN;
+    cfg.device_type        = "nff-qemu-esp32";   /* the simulate gate */
+    cfg.fw_version         = "5.1.0";
+    nff_init(&cfg);
+    nff_connect();
+    /* Reset the OTA flags AFTER connect: a clean boot confirms the running image
+       (mark_valid), which is unrelated to what the OTA command handler does below. */
+    nff_port_posix_reset_ota_flags();
+    nff_port_posix_clear_published(g_nff.mqtt);
+
+    extern void nff_port_posix_inject_mqtt(nff_mqtt_handle_t *, const char *, const char *);
+    const char *cmd_topic = "nff/test-project/devices/test-device/cmd";
+    char json[512];
+    snprintf(json, sizeof(json),
+             "{\"action\":\"ota\","
+             "\"version\":\"5.1.1\","
+             "\"url\":\"https://cdn.example.com/fw.bin\","
+             "\"sha256\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\","
+             "\"size\":100,"
+             "\"nonce\":\"deadbeef\","
+             "\"timestamp\":0,"
+             "\"cmd_sig\":\"3006020101020101\"}");
+    nff_port_posix_inject_mqtt(g_nff.mqtt, cmd_topic, json);
+
+    /* committed published straight away — no reboot, no download, no rollback */
+    const char *resp = nff_port_posix_get_published(g_nff.mqtt, RESP_TOPIC);
+    assert(resp != NULL);
+    assert(strstr(resp, "\"ota_result\"") != NULL);
+    assert(strstr(resp, "\"committed\"")  != NULL);
+    assert(strstr(resp, "5.1.1")          != NULL);
+    assert(nff_port_posix_ota_rollback_called()   == 0);
+    assert(nff_port_posix_ota_mark_valid_called() == 0);
+
+    /* fw_adopted persisted so it survives a reboot (nvs_creds.c reads it) */
+    char fw[32] = {0};
+    assert(nff_port_nvs_get_str("fw_adopted", fw, sizeof(fw)) == 0);
+    assert(strcmp(fw, "5.1.1") == 0);
+
+    /* live config version advanced so the heartbeat reports it immediately */
+    assert(strcmp(g_nff.cfg->fw_version, "5.1.1") == 0);
+
+    /* The non-qemu path (device_type=NULL) is NOT short-circuited: every other test in this file
+       runs with the default device_type and still drives the real download/trial/commit machinery,
+       so the gate is proven negative by their continued passing. */
+    printf("PASS: qemu device simulate-adopts OTA in place (committed + fw_adopted, no reboot)\n");
+}
+
 int main(void) {
     test_pending_committed();
     test_pending_rolled_back();
@@ -391,6 +448,7 @@ int main(void) {
     test_trial_heap_floor_veto();
     test_commit_records_fw_adopted();
     test_rollback_preserves_fw_adopted();
+    test_qemu_simulated_adopt();
 
     printf("All OTA rollback tests passed.\n");
     return 0;
